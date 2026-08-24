@@ -90,7 +90,7 @@ One or more tasks per slice.
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Done | ✅ |
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Done | ✅ |
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Done | ✅ |
-| T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Pending | - |
+| T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Done ✅ | (uncommitted→commit) |
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Pending | - |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Pending | - |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map. | Pending | - |
@@ -428,6 +428,38 @@ and reported separately. Full parity with mutate4go's bucket assignment.
   - **Doc debt (fold into T8):** `src/lib.rs` module-doc "Coverage, mutation, and reporting land in
     later slices" is now stale for **mutation** (apply landed). Fix opportunistically inside T8's work
     (T8 touches this area) — do not spin a standalone churn commit.
+- **T8 — APPROVE-WITH-SUGGESTIONS** (no blockers; commit not gated). `src/runner.rs` (new, infra) is
+  correctly layered: touches only `std::process`/`std::path`/`std::time`/`anyhow`/`wait_timeout`; no leak
+  into pure Core (confirmed both directions — runner doesn't import site/scanner, and site/scanner import
+  no process/fs/runner). Seams take domain primitives (`TestRunner::new(&[String], Duration, &Path)`,
+  `classify(bool,bool)`), NOT `&Cli` — `RunConfig` correctly still not introduced (YAGNI). Pure `classify`
+  (`#[must_use]`, total over 2 bools, unit-tested) split cleanly from side-effecting `TestRunner`/
+  `run_and_classify`, with `RawRunOutcome{tests_passed,timed_out}` as intermediate seam. A8/Go parity
+  faithful: passed→Survived, failed/compile-error/timeout→Killed, Uncovered reserved (never produced in
+  T8, lands S5). Doc debt from T7 cleared. Gate green (58 tests). Suggestions + carry-forwards:
+  - **Suggestion (non-blocking):** `classify(bool,bool)` takes two positional bools of the same type →
+    easy call-site transposition. Optional: `classify(RawRunOutcome)` / `RawRunOutcome::classify(self)`
+    for one source of truth. Current form keeps unit tests maximally direct — judgment call.
+  - **T9 (reporter) — relocate `MutantOutcome`:** it's a domain type currently in infra `runner`; the
+    reporter (Application) will `use crate::runner::MutantOutcome` (mild inward-flow smell). When the
+    reporter lands, move `MutantOutcome` to a pure module (own `outcome` module or alongside site model)
+    so the score buckets have a Core home and both reporter+runner depend inward on it.
+  - **T16/T17 (process-tree kill — real resource concern, not cosmetic):** on timeout `child.kill()`
+    reaps only `cargo`, not the grandchild test binary. Classification stays correct (→Killed), but an
+    orphaned hung test process can linger holding the shared `target/` build lock and **stall/block the
+    next mutant's `cargo test`** in single-worker mode. T16 isolated worker dirs don't fix the
+    single-worker case. **T17 must implement process-group (Unix) / job-object (Windows) kill** so the
+    whole subtree dies. Owed, not deferred-and-forgotten.
+  - **T17 (fixed `Duration` false-kills):** T8 takes a caller-supplied fixed timeout → systematically
+    false-kills slow-but-correct suites (inflates kill count, R3-adjacent). T17 must derive timeout from
+    a measured baseline test-phase × `--timeout-factor` (default 10) to keep false-timeouts rare.
+  - **T9 (pipeline wiring — two distinct paths + baseline):** loop must supply runner's `working_dir` as
+    the **crate root** (so `cargo test` recompiles the mutated file) while `RestoreGuard::new` binds to
+    the **target `.rs` file** — two separate caller-owned paths. T8 does **no baseline green-check**; the
+    pipeline (T9) owns confirming the suite is green *before* mutating, else every mutant misclassifies.
+    Keep `splice`/guard/runner **unfused** (no `apply_and_run`) — purity keeps splice+classify testable.
+    In multi-worker mode (T16) both the guarded path and `working_dir` must be the worker's **isolated
+    copy**, never canonical source.
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any

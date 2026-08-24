@@ -4,11 +4,13 @@
 //! modules are the pure **Core/domain** layer (the mutation-site model and the
 //! `syn` site-discovery walk — no fs/process/argv/clap); [`cli`] and [`manifest`]
 //! are the outer infrastructure adapters (argv parsing, TOML sidecar fs I/O).
-//! Coverage, mutation, and reporting land in later slices.
+//! Mutation apply and the test runner have landed; coverage and reporting land in
+//! later slices.
 
 pub mod apply;
 pub mod cli;
 pub mod manifest;
+pub mod runner;
 pub mod scanner;
 pub mod site;
 
