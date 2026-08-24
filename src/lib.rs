@@ -4,6 +4,8 @@
 //! exposes a trivial helper so the build/test gates have real code to exercise;
 //! the discovery, mutation, and reporting pipeline lands in later slices.
 
+pub mod cli;
+
 /// Returns the crate's package version, as declared in `Cargo.toml`.
 #[must_use]
 pub fn version() -> &'static str {

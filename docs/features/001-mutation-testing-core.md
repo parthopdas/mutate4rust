@@ -84,7 +84,7 @@ One or more tasks per slice.
 | #  | Slice | Task | Status | Commit |
 |----|-------|------|--------|--------|
 | T1  | S1 | `cargo init` binary crate `mutate4rust`; deps (`clap`, `syn` w/ full+span features, `proc-macro2`, `anyhow`, `toml`, `serde`); trivial lib fn + unit test so gates pass. | Done | ✅ |
-| T2  | S1 | clap CLI: positional `<FILE>` + all parity flags (parse only, wired to stubs); `--help`/`--version`; snapshot test; exit-code contract. | Pending | - |
+| T2  | S1 | clap CLI: positional `<FILE>` + all parity flags (parse only, wired to stubs); `--help`/`--version`; snapshot test; exit-code contract. | Done | ✅ |
 | T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Pending | - |
 | T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Pending | - |
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Pending | - |
@@ -273,3 +273,28 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     confirm the enabled feature sets.
   - Non-blocking niceties: consider `rust-version = "1.85"` (MSRV) in `[package]`;
     `version_matches_cargo_manifest` test is tautological scaffolding (harmless, will be superseded).
+- **T2 — APPROVE-WITH-SUGGESTIONS** (no blockers; commit not gated). Verified against upstream
+  `unclebob/mutate4go` source.
+  - **⚠ PRODUCT DECISION (pin before S3/T8) — exit-code contract is a deliberate divergence, NOT
+    parity.** Upstream exits **0 even when mutants survive** and collapses every error (usage or
+    operational) to **1** (`runner.StatusCode` returns 1 on any `err`; `Run` returns nil on
+    survivors). Our proposed `0=success / 1=survivors / 2=usage / 3=error` is the better *guardrail*
+    design (fail CI on survivors) but breaks CI parity for existing mutate4go pipelines. See "Product
+    decision — exit codes (C11)" below. Only `Success`(0) is emitted until S3, so it doesn't gate T2.
+  - **Verified parity ✓:** flag names + `--` spelling, `--verbose` as bool, `--lines` = comma-sep
+    positive ints (help text accurate), required `<FILE>`, `--mutation-warning` default 50.
+  - **T17:** upstream `--timeout-factor` is `int` default **10**; ours is `f64` with no default —
+    apply default 10 when wired.
+  - **S2/S7/S8:** add upstream's mutual-exclusivity rules (`--scan` vs update/exec opts;
+    `--since-last-run`/`--mutate-all`/`--lines` mutually exclusive) via clap `conflicts_with`/
+    `ArgGroup` (→ exit 2). None exist yet (parse-only).
+  - **T3 design.md must document:** adapter `Cli` → validated **clap-free `RunConfig`** handoff
+    (mirror upstream `cli.Options`; parse `lines: Option<String>` → `BTreeSet<usize>`, apply defaults
+    at the boundary); model scan/update-manifest/mutate as a **`Mode` enum** resolved at the boundary
+    (note latent gap: `run()` currently routes `--update-manifest` into the mutation stub).
+  - Optional: `--reuse-lcov` alias for strict parity with upstream's synonym.
+
+### Product decision — exit codes (C11) — PENDING HUMAN
+mutate4go: `0` = ran OK **incl. survivors**, `1` = any error. Proposed mutate4rust:
+`0` success / `1` survivors / `2` usage / `3` error. Awaiting human sign-off before S3/T8 returns the
+non-zero variants; T3's design.md will document whichever is chosen.
