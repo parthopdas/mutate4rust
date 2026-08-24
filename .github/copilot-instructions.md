@@ -75,11 +75,11 @@ numbering **stable** and update references on any insert/reorder.
 - **Pack:** `4-pack` _(role selector: `4-pack ⇒ orchestrator`, `1-pack ⇒ solo`; the `agentify` skill asks and stamps this — no default. Preflight Gate-1 **blocks** if unset, i.e. the value isn't `1-pack`/`4-pack`.)_
 - **Persona:** JARVIS _(driver skin; the `agentify` skill asks and stamps this — no default, not a preflight blocker. Menu = the overlays in `.github/personas/`, today JARVIS | FRIDAY.)_
 - **Generated artifacts (never edit):** `/target`
-- **App run/restart & liveness mechanism:** `<<FILL_ME: how to (re)start the app locally + any lifecycle/liveness signal, or "none">>`
+- **App run/restart & liveness mechanism:** `none` _(one-shot CLI; no resident process to restart or keep alive)_
 - **Build/test skills:** `.github/skills/build-test.md` (fast, Dave) and
   `.github/skills/build-test-full.md` (full, Bhaskar) are framework-owned recipes that run the commands
   named in the **Commands** table below — fill that table in for your stack.
-- **Language-specific conventions:** `<<FILL_ME: e.g. C#: prefer least-privilege access modifiers; avoid internal unless required>>`
+- **Language-specific conventions:** Rust: prefer least-privilege visibility (private by default; `pub(crate)` over `pub`); no `unwrap`/`expect` in library code — return `anyhow::Result` with context; `#![forbid(unsafe_code)]`; must be clippy-clean at `-D warnings`; rustfmt defaults.
 - **CI/CD pipeline:** `GitHub Actions - .github/workflows/ci.yml (fmt + clippy + build + test on ubuntu-latest & windows-latest). Agents never deploy.`
 
 ### Commands

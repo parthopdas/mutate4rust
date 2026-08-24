@@ -91,7 +91,7 @@ One or more tasks per slice.
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Done | ✅ |
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Done | ✅ |
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Done ✅ | cea810a |
-| T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Pending | - |
+| T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Done ✅ | (this commit) |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Pending | - |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map. | Pending | - |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6). | Pending | - |
@@ -460,6 +460,82 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     Keep `splice`/guard/runner **unfused** (no `apply_and_run`) — purity keeps splice+classify testable.
     In multi-worker mode (T16) both the guarded path and `working_dir` must be the worker's **isolated
     copy**, never canonical source.
+- **T9 — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S3 CLOSED — clear to proceed to S4/T10.** All
+  five T8 carry-forwards landed (suffix/radix preservation *plus* value-validation rejecting malformed
+  or operator-mismatched tokens; `MutantOutcome` → pure Core `src/outcome.rs`; distinct crate-root vs
+  target-file paths with `crate_root_of` correctly homed in the `cli.rs` adapter; pipeline-owned
+  baseline green-check proven to abort *before any write*, both red and timed-out branches;
+  splice/guard/runner still unfused). Module split (`outcome`+`operators` Core / `report`+`pipeline`
+  Application) is the minimum honest decomposition — nothing pre-empts a later slice; `pipeline` takes
+  domain primitives, no `&Cli`, and `RunConfig` correctly still does not exist.
+  - **Recorded deviation (endorsed, not a defect):** `pipeline` (Application) `use`s `apply::RestoreGuard`
+    and `runner::TestRunner` (Infrastructure) directly — an outward dependency normally inverted with a
+    port trait. Sanctioned by `docs/design.md` ("narrow seams named at the boundary" + no premature trait
+    seams). The pressure that would justify inverting it is **T16** (worker abstraction), not now.
+  - **Read-only-target test technique — endorsed** over a fake-writer trait seam: it tests the real
+    `RestoreGuard` against the real fs (a stronger proof than a fake), and the `writes_blocked` probe
+    degrades honestly on root containers (weaker, never wrong) instead of false-passing.
+  - **T13/S6 generalization cost did NOT rise.** `replacement(Operator, &str) -> Result<String>` is
+    token-in/token-out with exactly **one** call site, and `splice` is already `(original, span, repl)`.
+    T13 adds `Vec<Edit>` + a `splice_all` applying edits in **descending start order**; `replacement`
+    survives as the single-token fast path. Blast radius: `site.rs`, `apply.rs` (+1 fn), one block in
+    `pipeline.rs`; no public contract break.
+  - **Visibility nit (fold into an S8 cleanup, not a churn commit):** `outcome` had to be `pub` only
+    because `runner::classify` is `pub` — the lib's public surface is accidental (`apply`, `runner`,
+    `scanner`, `site`, `manifest` are `pub` though only `cli`+`version` are reachable from `main.rs`).
+    T9's own modules got this right (`mod operators/pipeline/report`).
+  - **Assumption rulings:** (a) `DEFAULT_MUTANT_TIMEOUT = 300s` is the right erring-long call (a false
+    timeout inflates the score under A8); (b) crate root = innermost `Cargo.toml` ancestor is correctly
+    layered — note `fs::canonicalize` yields `\\?\`-prefixed paths on Windows, harmless for `cargo` but
+    relevant to a custom `--test-command` (T17); (c) floats are a **taxonomy gap, not a bug** — no float
+    row exists in any slice → product decision below; (d) `0b0000_0001 → 0b0` is mutant-*formatting*
+    divergence with zero semantic effect (the mutant never reaches a diff or the manifest) — acceptable.
+  - **`MutationReport` — the one substantive finding:** three `usize` counters are faithful to
+    `docs/design.md` and A8, and `score() -> Option<f64>` on a zero denominator is right, but **a
+    survivor count with no survivor locations is not actionable**, and **T12/S5 must *list* uncovered
+    sites (A6), which a counter cannot do**. Report shape must carry per-mutant records by S5 → product
+    decision below. `summary()` is a **change-detector, not a contract** (same ruling as `--scan` in T6);
+    D4's JSON must serialize the model, never re-parse `summary()`.
+  - **S3 acceptance — met.** T7 (apply/restore) + T8 (runner/timeout/classify) + T9 (parity operators +
+    reporter), wired end-to-end through the CLI with C11 intact. Operator set is exactly the parity
+    table — `/`, `%`, compound-assignment absent from **both** scanner and operators, so S4 has no
+    partial state to unwind.
+  - **T10/S4:** `every_mapping_changes_the_token` is the guardrail to extend — every new operator row
+    must be added to it; a mapping returning its input produces an unkillable equivalent mutant.
+  - **T12/S5:** land the per-mutant record shape here (counters become derived, `summary()` becomes a
+    rendering) rather than bolting a parallel list onto `MutationReport`.
+  - **T13/S6:** extract `mutate_sites`' per-site body into `mutant_source(original, site)` first, so the
+    model generalization has one obvious point.
+  - **T15/S7:** `--lines` filters the **pipeline's site list**, not the scanner — a filter applied
+    between `scan_source` and the loop (`mutate_sites` iterates `sites` verbatim today).
+  - **T16/S8:** both `RestoreGuard`'s target **and** `crate_root` must point at the worker's isolated
+    copy; `crate_root_of` currently resolves against the canonical source and must be re-based.
+  - **T17:** make `check_baseline` **return the measured `Duration`** (it is already the measurement
+    point) and derive `timeout = baseline × --timeout-factor` (default **10**) — retires
+    `DEFAULT_MUTANT_TIMEOUT` with no new plumbing. Also wire `--test-command` (replaces
+    `runner::default_command()`), `--verbose` (the loop is currently silent for the whole run), and
+    `--mutation-warning`.
+  - **T17 — process-tree / job-object kill still owed (from T8):** `child.kill()` reaps only `cargo`,
+    leaving a hung grandchild test binary holding the `target/` build lock and stalling the *next*
+    mutant in single-worker mode. Not fixed by T16 isolation.
+
+### S3 slice-level assumptions — awaiting human sign-off
+- **S3 mutates the user's real source file in place.** The only crash backstop is VCS (T7's documented
+  `SIGKILL`/OOM caveat); nothing today refuses to run on a dirty target. Accepted for MVP — confirm
+  knowingly.
+- **`Uncovered` is a structurally-present, always-zero bucket until S5.** The slice's
+  "killed/survived/uncovered report" is satisfied in shape, not yet in production of the third bucket.
+- **Baseline abort is now a hard precondition:** a red or hanging suite fails the whole run with exit
+  `1` — correct, and **stricter than upstream**; it changes what a CI invocation does on an
+  already-broken build.
+
+### ⚠ Product decisions owed to the human (raised at S3 close)
+1. **Does the report name surviving mutants?** Counts only (current, `design.md`-faithful, minimal) vs.
+   per-mutant records with `file:line` + operator (upstream-like, actionable, and what S5's uncovered
+   listing needs anyway). Anders recommends **records, landed at T12** — decide before S5, since it
+   changes the reporter's shape.
+2. **Are float constants (`0.0↔1.0`) in scope?** Add to S4's idiomatic completions, or record a
+   permanent `Dx` deferral. Today it is an unstated gap — the taxonomy never mentions floats.
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any

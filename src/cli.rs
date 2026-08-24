@@ -6,12 +6,12 @@
 //! operator mappings) must never depend on this module — the dependency arrow
 //! points inward, from adapters toward the core.
 //!
-//! During the S1 bootstrap the flag surface below is **parse-only**: every option
-//! mirrors mutate4go's CLI for 1:1 muscle-memory parity (feature file C10), but the
-//! handlers are stubs. Scan, coverage, mutation, manifest, and test-running logic
-//! land in later slices.
+//! During the S1 bootstrap the flag surface below was **parse-only**: every option
+//! mirrors mutate4go's CLI for 1:1 muscle-memory parity (feature file C10). Scan,
+//! manifest, and the mutate loop are now wired; coverage gating and the remaining
+//! execution flags land in later slices.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,9 @@ use anyhow::Context;
 use clap::Parser;
 
 use crate::manifest::{self, CURRENT_SCHEMA_VERSION, INTERIM_HASHER_ID, Manifest};
+use crate::pipeline;
+use crate::report::MutationReport;
+use crate::runner;
 use crate::scanner;
 
 /// Default mutation-count warning threshold (feature file `--scan`/T6 note).
@@ -337,21 +340,69 @@ impl Cli {
         Ok(count)
     }
 
-    /// Stub for a normal mutation run (the mutate loop lands in S3).
+    /// Runs the mutate loop for the target file and reports the buckets.
+    ///
+    /// Surviving mutants are **reported, not signalled** — a completed run is
+    /// [`ExitStatus::Success`] (exit `0`) however many mutants survived (strict
+    /// mutate4go parity, decision C11). Only a genuine failure — an unreadable or
+    /// unparseable target, a red baseline suite, or an I/O error — maps onto
+    /// [`ExitStatus::Error`] (exit `1`).
     fn run_mutation(&self) -> ExitStatus {
-        println!(
-            "mutate4rust: mutation run for {} is not yet implemented (arrives in S3).",
-            self.file.display()
-        );
-        ExitStatus::Success
+        println!("Mutating {}...", self.file.display());
+        match self.mutate() {
+            Ok(report) => {
+                print!("{}", report.summary());
+                ExitStatus::Success
+            }
+            Err(err) => {
+                eprintln!("mutate4rust: {err:#}");
+                ExitStatus::Error
+            }
+        }
     }
+
+    /// Resolves the two caller-owned paths — the target `.rs` file and the crate
+    /// root the test command runs in — and drives the pipeline.
+    ///
+    /// `--test-command` and `--timeout-factor` are still unwired (T17); the run
+    /// uses [`runner::default_command`] and [`pipeline::DEFAULT_MUTANT_TIMEOUT`].
+    fn mutate(&self) -> anyhow::Result<MutationReport> {
+        let crate_root = crate_root_of(&self.file)?;
+        pipeline::run(
+            &self.file,
+            &crate_root,
+            &runner::default_command(),
+            pipeline::DEFAULT_MUTANT_TIMEOUT,
+        )
+    }
+}
+
+/// The nearest ancestor directory of `target` containing a `Cargo.toml` — the
+/// working directory the test command must run in so `cargo test` recompiles the
+/// mutated file.
+///
+/// Deliberately separate from the target path itself: the guard binds to the
+/// `.rs` file, the runner to the crate root.
+fn crate_root_of(target: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = std::fs::canonicalize(target)
+        .with_context(|| format!("failed to resolve target file `{}`", target.display()))?;
+    absolute
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .map(Path::to_path_buf)
+        .with_context(|| {
+            format!(
+                "no `Cargo.toml` found above `{}`; the target must live inside a cargo crate",
+                target.display()
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use std::path::Path;
 
     /// clap's own invariant checker — catches conflicting/ill-formed arg definitions.
     #[test]
@@ -718,5 +769,41 @@ mod tests {
              Mutation sites: 7\n\
              Changed sites: 0 (differential not yet active; reported as 0 until S7)\n",
         );
+    }
+
+    /// The crate root is the nearest ancestor holding a `Cargo.toml` — resolved
+    /// against this very crate, whose manifest dir is known at compile time.
+    #[test]
+    fn crate_root_resolves_to_the_enclosing_cargo_crate() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = crate_root_of(&manifest_dir.join("src").join("lib.rs")).expect("crate root");
+
+        assert_eq!(
+            root,
+            std::fs::canonicalize(&manifest_dir).expect("canonicalize manifest dir"),
+        );
+    }
+
+    /// A file with no `Cargo.toml` anywhere above it is a clear error, not a
+    /// silent fallback to some unrelated directory.
+    #[test]
+    fn crate_root_errors_outside_any_crate() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let orphan = dir.path().join("target.rs");
+        std::fs::write(&orphan, "fn f() {}\n").expect("seed source");
+
+        assert!(crate_root_of(&orphan).is_err());
+    }
+
+    /// A mutation run against a missing target is an error → exit `1` (C11). The
+    /// failure is raised while resolving paths, so no test command is ever spawned.
+    #[test]
+    fn mutation_run_on_a_missing_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("does-not-exist.rs");
+        let cli = Cli::try_parse_from(["mutate4rust", missing.to_str().unwrap()]).unwrap();
+
+        assert_eq!(Mode::resolve(&cli), Mode::Mutate);
+        assert_eq!(cli.run(), ExitStatus::Error);
     }
 }

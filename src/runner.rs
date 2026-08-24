@@ -6,7 +6,9 @@
 //! - [`classify`] is a pure decision over two booleans — no subprocess — so the
 //!   killed/survived logic is unit-testable in isolation.
 //! - [`TestRunner`] spawns the test command in a working directory, waits with a
-//!   timeout, and folds the result into a [`MutantOutcome`].
+//!   timeout, and folds the result into a [`MutantOutcome`] (the buckets live in
+//!   the pure [`crate::outcome`] module, so runner and reporter both depend
+//!   inward on the same type).
 //!
 //! # Classification semantics (mutate4go parity — decision A8)
 //!
@@ -17,8 +19,8 @@
 //!   (folded into killed, per A8 — not a separate bucket).
 //! - a **timeout** (mutant likely introduced a hang) → [`MutantOutcome::Killed`] (A8).
 //!
-//! [`MutantOutcome::Uncovered`] is reserved here but **never produced** by T8 —
-//! coverage gating lands in a later slice (S5).
+//! [`MutantOutcome::Uncovered`] is reserved here but **never produced** by the S3
+//! runner — coverage gating lands in a later slice (S5).
 //!
 //! # Durability assumption
 //!
@@ -34,22 +36,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use wait_timeout::ChildExt;
 
-/// The outcome of testing a single mutant.
-///
-/// [`Uncovered`](MutantOutcome::Uncovered) is reserved for coverage gating (S5)
-/// and is never produced by the T8 runner, which only ever yields
-/// [`Killed`](MutantOutcome::Killed) or [`Survived`](MutantOutcome::Survived).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutantOutcome {
-    /// The mutant was detected — a test failed, the mutant did not compile, or the
-    /// test run timed out (all folded into killed, per A8).
-    Killed,
-    /// The mutant was not detected — the tests still passed with it applied.
-    Survived,
-    /// The mutant's site is not exercised by the test suite. Reserved for coverage
-    /// gating (S5); never produced by the T8 runner.
-    Uncovered,
-}
+use crate::outcome::MutantOutcome;
 
 /// The raw result of one test-command execution, before classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +158,8 @@ impl TestRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{MutantOutcome, TestRunner, classify, default_command};
+    use super::{TestRunner, classify, default_command};
+    use crate::outcome::MutantOutcome;
     use std::time::Duration;
 
     #[test]
