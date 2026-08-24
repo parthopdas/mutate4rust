@@ -88,7 +88,7 @@ One or more tasks per slice.
 | T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Done | ✅ |
 | T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Done | ✅ |
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Done | ✅ |
-| T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Pending | - |
+| T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Done | ✅ |
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Pending | - |
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Pending | - |
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Pending | - |
@@ -370,6 +370,33 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     churn (upstream parity — make it a conscious call). Land clap `ArgGroup` mutual-exclusivity
     resolving conflicts to **exit 1 BEFORE any manifest write** (so a mis-flagged invocation never
     mutates a sidecar then errors).
+- **T6 — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S2 CLOSED — clear to proceed to S3.** `--scan`
+  is cleanly seamed: pure `ScanReport { file, total_sites, changed_sites, warn_threshold }` (value +
+  `summary()`/`warning()`/`exceeds_threshold()`, strict `>`) with the handler doing only I/O + stream
+  routing (summary → stdout, advisory → stderr). The pure seam is **param-based, not adapter-based**
+  (`scan_report()` extracts `&source` and hands `&str` inward, never threads `&Cli`) — exactly the
+  inward-dependency posture; preserve it into S3. Absent manifest tolerated (`Ok(None)` → Success,
+  changed = 0), read-only (no runner/mutation path reachable from `Mode::Scan`), C11 intact. Changed =
+  hard `0` is acceptable **only because** the inline disclaimer makes the misread impossible — keep the
+  disclaimer mandatory.
+  - **S2 acceptance — all met** across T4 (syn site model) + T5 (sidecar read/write + `--update-manifest`,
+    closes latent `Mode` gap) + T6 (`--scan` counts + mutation-warning). Coherence note (not a gap):
+    `Mode::resolve` is **precedence-only** (`--scan --update-manifest` silently → scan, no error); the
+    `ArgGroup`→exit-1 enforcement is a **recorded** deferral to T15/S8 — the silent-precedence→exit-1
+    shift is a latent behavior change landing then (fine pre-1.0).
+  - **S3 GUARDRAIL (carry-forward):** S3 seams (T7 apply/restore, T8 runner+classify, T9
+    operators+reporter) must take **domain primitives** (`source: &str`, `timeout: Duration`,
+    `&[Site]`), **never `&Cli`**. The clap-free `RunConfig` translation is **NOT** needed for S3 —
+    introducing it now is YAGNI; the pressure that justifies it is S5/S7/S8 flag-wiring (`--lines`,
+    `--timeout-factor`, `--test-command`, `--reuse-coverage`). Keep the T5/T6 primitive-extraction
+    pattern so `RunConfig` can be introduced lazily rather than retrofitted out of `&Cli` coupling.
+  - **T15 (carry-forward):** replace the **entire** `Changed sites:` line — value **and** the stale
+    "differential not yet active" prose — not just the `STUB_CHANGED_SITES` constant, or the
+    interpolated value will self-contradict the fixed disclaimer.
+  - **T6 confirms owed (non-blocking):** verify warning→stderr routing matches upstream mutate4go (if
+    upstream prints to stdout, note the defensible divergence); declare `--scan` **text** output
+    human-oriented and **not** a stability contract pre-1.0 (structured/JSON scan output is D4) — the
+    `scan_report_summary_is_stable_and_greppable` snapshot is a change-detector, not a frozen contract.
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any

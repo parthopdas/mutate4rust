@@ -19,9 +19,18 @@ use anyhow::Context;
 use clap::Parser;
 
 use crate::manifest::{self, CURRENT_SCHEMA_VERSION, INTERIM_HASHER_ID, Manifest};
+use crate::scanner;
 
 /// Default mutation-count warning threshold (feature file `--scan`/T6 note).
 const DEFAULT_MUTATION_WARNING: usize = 50;
+
+/// Changed-site count reported by `--scan` until differential hashing lands.
+///
+/// The `--scan` task text pins this to `0`: per-function hash diffing isn't built
+/// yet, so the mode reports a deterministic stub rather than a real changed count.
+//
+// TODO(S7/T14): compute real changed-site count via per-function hash diff.
+const STUB_CHANGED_SITES: usize = 0;
 
 /// Exit-code contract for `mutate4rust` — **strict mutate4go parity** (decision C11).
 ///
@@ -85,6 +94,54 @@ impl Mode {
         } else {
             Mode::Mutate
         }
+    }
+}
+
+/// A deterministic, greppable `--scan` report, computed purely from the scan
+/// counts and threshold — deliberately kept free of I/O so its output shape and
+/// warning logic can be unit-tested directly, while [`Cli::run_scan`] does the
+/// file/sidecar reads and routes the rendered text to the right stream.
+struct ScanReport {
+    /// The scanned file, as displayed to the user (`self.file.display()`).
+    file: String,
+    /// Total in-scope mutation sites discovered by [`scanner::scan_source`].
+    total_sites: usize,
+    /// Sites changed since the manifest — the [`STUB_CHANGED_SITES`] stub for now.
+    changed_sites: usize,
+    /// `--mutation-warning` threshold; a strictly greater total is advisory-warned.
+    warn_threshold: usize,
+}
+
+impl ScanReport {
+    /// Whether the site total strictly exceeds the warning threshold, in which
+    /// case an advisory warning fires. Equal-to-threshold does **not** warn.
+    fn exceeds_threshold(&self) -> bool {
+        self.total_sites > self.warn_threshold
+    }
+
+    /// The primary report body for stdout: a stable, greppable multi-line summary
+    /// (trailing newline included) suitable for snapshot testing.
+    fn summary(&self) -> String {
+        format!(
+            "Scanning {}...\n\
+             Mutation sites: {}\n\
+             Changed sites: {} (differential not yet active; reported as 0 until S7)\n",
+            self.file, self.total_sites, self.changed_sites,
+        )
+    }
+
+    /// The advisory over-threshold warning line, or `None` when at/below threshold.
+    ///
+    /// Advisory only — `--scan` is read-only, so a large count is not an error
+    /// (C11); this just helps users avoid accidentally launching a huge run.
+    fn warning(&self) -> Option<String> {
+        self.exceeds_threshold().then(|| {
+            format!(
+                "warning: {} mutation sites exceed the --mutation-warning threshold ({}); \
+                 this may be a large mutation run",
+                self.total_sites, self.warn_threshold,
+            )
+        })
     }
 }
 
@@ -189,13 +246,53 @@ impl Cli {
         }
     }
 
-    /// Stub for `--scan` mode (site counting lands in S2 / T6).
+    /// Reports mutation-site counts for `--scan` without running tests or applying
+    /// mutations — a **read-only** mode (mutate4go parity, feature file C11).
+    ///
+    /// Reads the target source from disk (infrastructure) and the sidecar manifest
+    /// (tolerating a first-run absence, [`manifest::read`] → `Ok(None)`), then
+    /// derives a pure [`ScanReport`]. The primary summary goes to stdout; the
+    /// over-threshold advisory (if any) goes to stderr. Any I/O or parse failure
+    /// maps onto [`ExitStatus::Error`] (C11: exit `1`); a successful scan — even a
+    /// large one that triggers the warning — is [`ExitStatus::Success`] (exit `0`).
     fn run_scan(&self) -> ExitStatus {
-        println!(
-            "mutate4rust: --scan for {} is not yet implemented (arrives in S2).",
-            self.file.display()
-        );
-        ExitStatus::Success
+        match self.scan_report() {
+            Ok(report) => {
+                print!("{}", report.summary());
+                if let Some(warning) = report.warning() {
+                    eprintln!("{warning}");
+                }
+                ExitStatus::Success
+            }
+            Err(err) => {
+                eprintln!("mutate4rust: {err:#}");
+                ExitStatus::Error
+            }
+        }
+    }
+
+    /// Reads the source and sidecar and assembles the pure [`ScanReport`].
+    ///
+    /// Reading the source from disk and the sidecar are infrastructure work done
+    /// here; site counting is delegated to the pure [`scanner::scan_source`] seam.
+    /// A missing sidecar is the normal first-run case ([`manifest::read`] returns
+    /// `Ok(None)`) and must **not** error. The changed-site count is the
+    /// [`STUB_CHANGED_SITES`] stub until differential hashing lands (S7/T14).
+    fn scan_report(&self) -> anyhow::Result<ScanReport> {
+        let source = std::fs::read_to_string(&self.file)
+            .with_context(|| format!("failed to read source `{}`", self.file.display()))?;
+        let total_sites = scanner::scan_source(&source)?.len();
+        // Absence is a normal first run, not an error; the value is unused while
+        // the changed count is stubbed (see STUB_CHANGED_SITES) but the read must
+        // still surface genuine I/O / malformed-TOML failures.
+        // TODO(S7/T14): compute real changed-site count via per-function hash diff.
+        let _manifest = manifest::read(&manifest::sidecar_path(&self.file))?;
+        Ok(ScanReport {
+            file: self.file.display().to_string(),
+            total_sites,
+            changed_sites: STUB_CHANGED_SITES,
+            warn_threshold: self.mutation_warning,
+        })
     }
 
     /// Refreshes the sidecar manifest (`<file>.rs.m4r.toml`) from the target file.
@@ -254,6 +351,7 @@ impl Cli {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::path::Path;
 
     /// clap's own invariant checker — catches conflicting/ill-formed arg definitions.
     #[test]
@@ -467,5 +565,158 @@ mod tests {
             .expect("sidecar should read")
             .expect("sidecar should exist beside the source");
         assert!(!recorded.functions.is_empty());
+    }
+
+    /// Seeds a temp `.rs` file with three in-scope arithmetic sites (`+ - *`) and
+    /// returns the RAII temp dir plus the file path. The dir is dropped by the
+    /// caller (cleaned even on panic).
+    fn seed_three_site_source() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_path = dir.path().join("target.rs");
+        std::fs::write(
+            &source_path,
+            "fn add(a: i32, b: i32) -> i32 { a + b }\n\
+             fn sub(a: i32, b: i32) -> i32 { a - b }\n\
+             fn mul(a: i32, b: i32) -> i32 { a * b }\n",
+        )
+        .expect("seed source file");
+        (dir, source_path)
+    }
+
+    fn scan_cli(source_path: &Path, extra: &[&str]) -> Cli {
+        let mut args = vec!["mutate4rust", source_path.to_str().unwrap(), "--scan"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    /// The reported total equals `scan_source` for the same content — the scan
+    /// report is a thin count over the pure scanner, and the changed count is the
+    /// stub `0`.
+    #[test]
+    fn scan_report_total_matches_scan_source() {
+        let (_dir, source_path) = seed_three_site_source();
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let expected = crate::scanner::scan_source(&source).unwrap().len();
+
+        let report = scan_cli(&source_path, &[]).scan_report().expect("scan ok");
+
+        assert_eq!(report.total_sites, expected);
+        assert_eq!(report.total_sites, 3);
+        assert_eq!(report.changed_sites, 0);
+    }
+
+    /// With **no sidecar present** the scan still succeeds and reports changed `0`
+    /// — an absent manifest is the normal first run, not an error (C11). Driven
+    /// through `run()` so `Mode::Scan` dispatch is exercised end-to-end.
+    #[test]
+    fn scan_without_sidecar_succeeds_and_is_not_an_error() {
+        let (_dir, source_path) = seed_three_site_source();
+        // No sidecar was written, so the manifest read returns Ok(None).
+        assert_eq!(
+            manifest::read(&manifest::sidecar_path(&source_path)).unwrap(),
+            None,
+        );
+
+        let cli = scan_cli(&source_path, &[]);
+        let report = cli.scan_report().expect("absent sidecar is not an error");
+        assert_eq!(report.changed_sites, 0);
+
+        // End-to-end through dispatch: Mode::Scan routes here and returns Success.
+        assert_eq!(scan_cli(&source_path, &[]).run(), ExitStatus::Success);
+    }
+
+    /// With a sidecar present the scan still succeeds and changed remains the stub
+    /// `0` (differential diffing isn't built yet — S7/T14).
+    #[test]
+    fn scan_with_sidecar_present_still_reports_stub_zero() {
+        let (_dir, source_path) = seed_three_site_source();
+        // Write a real sidecar beside the source via --update-manifest dispatch.
+        let update = Cli::try_parse_from([
+            "mutate4rust",
+            source_path.to_str().unwrap(),
+            "--update-manifest",
+        ])
+        .unwrap();
+        assert_eq!(update.run(), ExitStatus::Success);
+        assert!(
+            manifest::read(&manifest::sidecar_path(&source_path))
+                .unwrap()
+                .is_some(),
+            "sidecar should now exist",
+        );
+
+        let report = scan_cli(&source_path, &[]).scan_report().expect("scan ok");
+        assert_eq!(report.changed_sites, 0);
+        assert_eq!(scan_cli(&source_path, &[]).run(), ExitStatus::Success);
+    }
+
+    /// A missing target file is an I/O error → `ExitStatus::Error` (exit 1, C11).
+    #[test]
+    fn scan_missing_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("does-not-exist.rs");
+        let cli = scan_cli(&missing, &[]);
+
+        assert!(cli.scan_report().is_err());
+        assert_eq!(scan_cli(&missing, &[]).run(), ExitStatus::Error);
+    }
+
+    /// The over-threshold warning fires only when the total strictly exceeds the
+    /// threshold; equal-to and below the threshold stay silent (pure logic).
+    #[test]
+    fn scan_report_warning_fires_only_above_threshold() {
+        let report = |total, threshold| ScanReport {
+            file: "x.rs".to_owned(),
+            total_sites: total,
+            changed_sites: 0,
+            warn_threshold: threshold,
+        };
+
+        assert!(report(2, 1).warning().is_some(), "above threshold warns");
+        assert!(report(1, 1).warning().is_none(), "at threshold is silent");
+        assert!(
+            report(0, 1).warning().is_none(),
+            "below threshold is silent"
+        );
+    }
+
+    /// A low `--mutation-warning` against a >1-site file triggers the advisory
+    /// warning; the default (50) against the same file does not — exercised via
+    /// the real handler path (`scan_report`), and both scans still succeed.
+    #[test]
+    fn scan_mutation_warning_threshold_wiring() {
+        let (_dir, source_path) = seed_three_site_source();
+
+        let low = scan_cli(&source_path, &["--mutation-warning", "1"])
+            .scan_report()
+            .expect("scan ok");
+        assert!(low.warning().is_some(), "3 sites exceed threshold 1");
+        assert_eq!(
+            scan_cli(&source_path, &["--mutation-warning", "1"]).run(),
+            ExitStatus::Success,
+            "a warning is advisory, not an error",
+        );
+
+        let default = scan_cli(&source_path, &[]).scan_report().expect("scan ok");
+        assert!(default.warning().is_none(), "3 sites are below default 50");
+    }
+
+    /// The summary is stable and greppable: the `Scanning`, `Mutation sites`, and
+    /// `Changed sites` lines with the stub note, each newline-terminated.
+    #[test]
+    fn scan_report_summary_is_stable_and_greppable() {
+        let report = ScanReport {
+            file: "src/lib.rs".to_owned(),
+            total_sites: 7,
+            changed_sites: 0,
+            warn_threshold: 50,
+        };
+
+        assert_eq!(
+            report.summary(),
+            "Scanning src/lib.rs...\n\
+             Mutation sites: 7\n\
+             Changed sites: 0 (differential not yet active; reported as 0 until S7)\n",
+        );
     }
 }
