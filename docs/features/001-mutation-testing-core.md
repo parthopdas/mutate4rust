@@ -1,6 +1,6 @@
 # Feature: Mutation Testing Core (mutate4rust)
 **Branch:** vibe/001-mutation-testing-core
-**Status:** Planning
+**Status:** In Progress
 
 ## Requirements
 
@@ -83,7 +83,7 @@ One or more tasks per slice.
 
 | #  | Slice | Task | Status | Commit |
 |----|-------|------|--------|--------|
-| T1  | S1 | `cargo init` binary crate `mutate4rust`; deps (`clap`, `syn` w/ full+span features, `proc-macro2`, `anyhow`, `toml`, `serde`); trivial lib fn + unit test so gates pass. | Pending | - |
+| T1  | S1 | `cargo init` binary crate `mutate4rust`; deps (`clap`, `syn` w/ full+span features, `proc-macro2`, `anyhow`, `toml`, `serde`); trivial lib fn + unit test so gates pass. | Done | ✅ |
 | T2  | S1 | clap CLI: positional `<FILE>` + all parity flags (parse only, wired to stubs); `--help`/`--version`; snapshot test; exit-code contract. | Pending | - |
 | T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Pending | - |
 | T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Pending | - |
@@ -257,3 +257,19 @@ and reported separately. Full parity with mutate4go's bucket assignment.
 
 ### Open item flagged for later verification
 - A6 `--reuse-coverage`-without-coverage edge — resolve against upstream source during S5.
+
+### Task reviews — Anders (design)
+- **T1 — APPROVE-WITH-SUGGESTIONS** (no blockers). Guidance to carry forward:
+  - **T3 must-do:** write the **inward dependency-flow / pure-core boundary** into `docs/design.md`:
+    *Core/domain* (pure: mutation-site model + operator mappings — no fs/process/clap) ← *Application*
+    (discover→coverage→mutate→test→report pipeline) ← *Infrastructure/adapters* (`cargo test` runner,
+    `cargo-llvm-cov`, TOML sidecar I/O, clap CLI). Dependency arrows point inward; `operators`/site
+    model must never `use` runner/coverage/fs. No premature trait seams (YAGNI) — just name the
+    boundary so downstream tasks land on the right side.
+  - Modules live **inside the lib**; `main.rs` stays a thin outer adapter. No workspace/multi-crate
+    split at MVP.
+  - **Caveat for T4/T5:** a green T1 build proves dep versions *resolve*, not that `syn`/`serde`/`toml`
+    feature flags are correct — those aren't compiled-against until first use. T4/T5 should explicitly
+    confirm the enabled feature sets.
+  - Non-blocking niceties: consider `rust-version = "1.85"` (MSRV) in `[package]`;
+    `version_matches_cargo_manifest` test is tautological scaffolding (harmless, will be superseded).
