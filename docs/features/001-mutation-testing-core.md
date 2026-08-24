@@ -93,7 +93,7 @@ One or more tasks per slice.
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Done ✅ | cea810a |
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Done ✅ | 54d30e2 |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Done ✅ | 04b15fd |
-| T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map. | Pending | - |
+| T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map; **add `llvm-tools-preview` + `cargo-llvm-cov` to both CI legs**; **verify A6 `--reuse-coverage`-without-coverage against upstream**. | Pending | - |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Pending | - |
 | T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise, **float constants (`0.0↔1.0`)**; precondition-gated emission (A8-adjacent). | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
@@ -582,20 +582,20 @@ and reported separately. Full parity with mutate4go's bucket assignment.
   - **T17 — `--mutation-warning` default 50:** keep it and document the divergence, or scale it. A
     conscious call, not a silent parity inherit.
 
-### ⚠ S5 slice-level items owed to the human (raised at S4 close)
-1. **R8 / external tool dependency** — S5 is the first slice that cannot run on a bare `cargo` install.
-   Confirm `cargo-llvm-cov` + `llvm-tools-preview` go into **both** CI legs at T11, and that a missing
-   tool is a hard exit-`1` with an install hint. This raises contributor onboarding cost.
-2. **A6 open edge — `--reuse-coverage` with no coverage file.** Flagged at design time for S5
-   verification against upstream; provisional answer is "error, ask the user to run coverage or drop the
-   flag". T11 is the moment to **verify, not guess**.
-3. **R3/D6 — panic-killed mutants inflate the score, and S4 made it systematic.** Options short of D6:
-   (a) do nothing, accept the current posture; (b) T12 records make panic-kills *visible* without
-   changing the bucket. Anders recommends **(b)** — near-zero cost inside work already planned, and it
-   tells you whether D6 is worth taking before committing to it.
-4. **Visibility only, not a decision:** after S6 the default run will be substantially further from
-   mutate4go's mutation count than A5's prose implies today. A5 stands; consider recording the expected
-   magnitude once S6 lands.
+### ⚠ S5 slice-level items owed to the human (raised at S4 close) — RESOLVED
+1. **R8 / external tool dependency — CONFIRMED.** `cargo-llvm-cov` + `llvm-tools-preview` go into
+   **both** CI legs (`ubuntu-latest` **and** `windows-latest`) at **T11**, and a missing tool is a hard
+   exit-`1` carrying an install hint — never a silent mutate-everything (A6). The raised contributor
+   onboarding cost is accepted.
+2. **A6 open edge — VERIFY, DON'T GUESS.** T11 must resolve `--reuse-coverage`-without-coverage against
+   **upstream `unclebob/mutate4go` source** and then **match upstream's behavior**. The provisional
+   "error and tell the user" answer is a fallback only if upstream is genuinely silent on the case;
+   record what upstream actually does either way.
+3. **R3/D6 panic-killed mutants — OPTION (b).** T12's per-mutant records make panic-kills
+   **distinguishable in the record while the bucket stays `Killed`** (A8 unchanged). D6 stays deferred;
+   the records tell us whether it is worth taking.
+4. **Visibility item noted** — record the expected count-divergence magnitude once S6 lands. A5 stands
+   as written.
 
 ### S3 slice-level assumptions — awaiting human sign-off
 - **S3 mutates the user's real source file in place.** The only crash backstop is VCS (T7's documented
