@@ -89,7 +89,7 @@ One or more tasks per slice.
 | T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Done | ✅ |
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Done | ✅ |
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Done | ✅ |
-| T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Pending | - |
+| T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Done | ✅ |
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Pending | - |
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Pending | - |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Pending | - |
@@ -397,6 +397,37 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     upstream prints to stdout, note the defensible divergence); declare `--scan` **text** output
     human-oriented and **not** a stability contract pre-1.0 (structured/JSON scan output is D4) — the
     `scan_report_summary_is_stable_and_greppable` snapshot is a change-detector, not a frozen contract.
+- **T7 — APPROVE-WITH-SUGGESTIONS** (no code changes). `src/apply.rs` realizes **C6** cleanly: pure
+  `splice` (prefix+replacement+suffix, validates bounds + UTF-8 char boundaries → `Err`, never panics,
+  never `syn`-reprints) + infra `RestoreGuard` (owns in-memory original; `write_mutant`/`restore`
+  idempotent; `Drop` best-effort restore, never panics). Correctly layered (splice pure, guard the only
+  fs touch), seams take domain primitives (no `&Cli`). All suggestions are carry-forwards, not defects.
+  - **T8 loop pattern (prescribed):** `RestoreGuard::new(path)` ONCE → per-site
+    `splice(guard.original(), &site.byte_span, repl)` (always from the pristine in-memory original →
+    **zero mutation accumulation** between sites) → `write_mutant` → run tests/classify → `restore()`
+    every iteration (idempotent, cheap; matters for terminal state + skip/early-break/error paths).
+    Keep `splice`/guard **unfused** (no `apply_site()` convenience — purity is what makes splice
+    unit-testable). Take domain primitives (`&str`, `Duration`, `&[Site]`, `&Path`), not `&Cli`.
+  - **T8 durability note (document, don't over-engineer):** the original is **in-memory only** — on
+    `SIGKILL`/OOM/power-loss with a mutant on disk, `Drop` never runs and the mutated bytes are the
+    final on-disk state (and `fs::write` is non-atomic: crash mid-write can truncate). Backstop is
+    **VCS** (`git checkout -- <file>`). T8 should state the "target under version control" assumption
+    explicitly and, if cheap, note/refuse on a dirty target so crash-recovery is unambiguous.
+  - **Repo-wide guard:** the `Drop` panic-restore relies on `panic = "unwind"` (default; confirmed no
+    `[profile]` override). A future `panic = "abort"` silently defeats the safety-net — guard against
+    that profile change (comment / CI check).
+  - **T16 (composes cleanly — a strength):** `RestoreGuard` is **per-path** with no shared/global
+    state, so N workers ⇒ N guards ⇒ N distinct isolated-copy paths ⇒ no cross-worker interference.
+    Carry-forward: in multi-worker mode the guarded path MUST be the worker's **isolated copy**, never
+    the canonical source — the pipeline (caller) owns that path decision, not the guard.
+  - **Splice honesty caveat:** the char-boundary check guarantees **byte-safety** (no corruption/panic),
+    NOT semantic correctness. A stale/off-by-a-token span from a mismatched source revision splices
+    cleanly into garbage without error → becomes a non-compiling mutant → A8 folds into **Killed** (not
+    a crash). Scanner (T4, proven byte-accurate) owns "the span means the operator"; T8 must not read
+    the boundary check as a correctness guarantee.
+  - **Doc debt (fold into T8):** `src/lib.rs` module-doc "Coverage, mutation, and reporting land in
+    later slices" is now stale for **mutation** (apply landed). Fix opportunistically inside T8's work
+    (T8 touches this area) — do not spin a standalone churn commit.
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any

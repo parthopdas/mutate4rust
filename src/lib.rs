@@ -6,6 +6,7 @@
 //! are the outer infrastructure adapters (argv parsing, TOML sidecar fs I/O).
 //! Coverage, mutation, and reporting land in later slices.
 
+pub mod apply;
 pub mod cli;
 pub mod manifest;
 pub mod scanner;
