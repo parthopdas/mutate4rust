@@ -94,8 +94,8 @@ One or more tasks per slice.
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Done ✅ | 54d30e2 |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Pending | - |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map. | Pending | - |
-| T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6). | Pending | - |
-| T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise; precondition-gated emission (A8-adjacent). | Pending | - |
+| T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Pending | - |
+| T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise, **float constants (`0.0↔1.0`)**; precondition-gated emission (A8-adjacent). | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
 | T15 | S7 | `--since-last-run`, `--mutate-all`, `--lines`; post-run manifest update; wire changed-count into `--scan`. | Pending | - |
 | T16 | S8 | `--max-workers` isolated worker dirs (isolated target/source copy, seeded from warmed baseline) + aggregation. | Pending | - |
@@ -137,6 +137,7 @@ same way); **idiomatic** entries are Rust-native additions. All are **active by 
 | `Result` | `.is_ok()` ↔ `.is_err()`; `Ok(x) → Err(_)` where a bound error value exists | idiomatic |
 | `match`-arm | drop an arm guard (`if guard` removed); swap two non-wildcard arm bodies | idiomatic |
 | `unwrap`/`expect` | `.unwrap()` / `.expect(_)` → `.unwrap_or_default()` (where `T: Default`) | idiomatic |
+| Float constant | `0.0` ↔ `1.0` (suffix `f32`/`f64` preserved) | idiomatic |
 | `?` operator | `expr? → expr.unwrap()` where the `Try` type permits | idiomatic |
 | Bitwise | `&` ↔ `|`; `^ → &`; `<<` ↔ `>>` | idiomatic |
 
@@ -529,13 +530,21 @@ and reported separately. Full parity with mutate4go's bucket assignment.
   `1` — correct, and **stricter than upstream**; it changes what a CI invocation does on an
   already-broken build.
 
-### ⚠ Product decisions owed to the human (raised at S3 close)
-1. **Does the report name surviving mutants?** Counts only (current, `design.md`-faithful, minimal) vs.
-   per-mutant records with `file:line` + operator (upstream-like, actionable, and what S5's uncovered
-   listing needs anyway). Anders recommends **records, landed at T12** — decide before S5, since it
-   changes the reporter's shape.
-2. **Are float constants (`0.0↔1.0`) in scope?** Add to S4's idiomatic completions, or record a
-   permanent `Dx` deferral. Today it is an unstated gap — the taxonomy never mentions floats.
+### ⚠ Product decisions owed to the human (raised at S3 close) — RESOLVED
+1. **Does the report name surviving mutants? → RECORDS, AT T12.** `MutationReport` grows per-mutant
+   records (`file:line` + operator/kind + outcome) at **T12/S5**, where uncovered-site listing (A6)
+   forces the same shape anyway; counters become **derived** and `summary()` becomes a rendering of the
+   model. Not retrofitted now — T9's counter shape stands until T12.
+2. **Are float constants (`0.0↔1.0`) in scope? → IN SCOPE, BUT NOT T10.** Parked in **S6** with the other
+   idiomatic operators, NOT added to S4's arithmetic completions. T10 therefore stays integer-only.
+   Requires a `syn::LitFloat` scanner arm + a float-aware constant mapping preserving `f32`/`f64`
+   suffixes (`mutate_int_literal` will not stretch — separate path).
+
+### S3 slice-level assumptions — SIGNED OFF by the human at S3 close
+All three accepted as stated: (1) in-place mutation of the real source with VCS as the only crash
+backstop, and **no dirty-target guard** (explicitly declined as a task — revisit only if it bites);
+(2) `Uncovered` structurally present but always zero until S5; (3) baseline abort as a hard
+precondition (exit `1` on a red/hanging suite), knowingly **stricter than upstream mutate4go**.
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any
