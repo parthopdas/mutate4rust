@@ -2,10 +2,12 @@
 //!
 //! This crate hosts the mutation-testing engine. The [`site`] and [`scanner`]
 //! modules are the pure **Core/domain** layer (the mutation-site model and the
-//! `syn` site-discovery walk — no fs/process/argv/clap); [`cli`] is the outer
-//! infrastructure adapter. Coverage, mutation, and reporting land in later slices.
+//! `syn` site-discovery walk — no fs/process/argv/clap); [`cli`] and [`manifest`]
+//! are the outer infrastructure adapters (argv parsing, TOML sidecar fs I/O).
+//! Coverage, mutation, and reporting land in later slices.
 
 pub mod cli;
+pub mod manifest;
 pub mod scanner;
 pub mod site;
 

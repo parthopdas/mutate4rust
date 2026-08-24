@@ -13,8 +13,12 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use clap::Parser;
+
+use crate::manifest::{self, CURRENT_SCHEMA_VERSION, INTERIM_HASHER_ID, Manifest};
 
 /// Default mutation-count warning threshold (feature file `--scan`/T6 note).
 const DEFAULT_MUTATION_WARNING: usize = 50;
@@ -51,6 +55,36 @@ impl ExitStatus {
     /// Maps the outcome onto the documented process exit code.
     fn code(self) -> ExitCode {
         ExitCode::from(self.raw_code())
+    }
+}
+
+/// The resolved run mode (design.md → `Mode` enum at the CLI boundary).
+///
+/// Precedence mirrors upstream: `--scan` wins, else `--update-manifest`, else a
+/// normal mutation run.
+//
+// TODO(S7/T15): enforce mutual exclusivity via clap ArgGroup — for now precedence
+// is resolved deterministically here rather than rejecting conflicting flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Report mutation-site counts without running tests (`--scan`).
+    Scan,
+    /// Refresh the sidecar manifest (`--update-manifest`).
+    UpdateManifest,
+    /// A normal mutation run.
+    Mutate,
+}
+
+impl Mode {
+    /// Resolves the mode from parsed flags with deterministic precedence.
+    fn resolve(cli: &Cli) -> Mode {
+        if cli.scan {
+            Mode::Scan
+        } else if cli.update_manifest {
+            Mode::UpdateManifest
+        } else {
+            Mode::Mutate
+        }
     }
 }
 
@@ -120,7 +154,7 @@ impl Cli {
     #[must_use]
     pub fn main() -> ExitCode {
         match Self::try_parse() {
-            Ok(cli) => cli.run(),
+            Ok(cli) => cli.run().code(),
             Err(err) => {
                 // Renders the message (stderr for errors, stdout for help/version).
                 let _ = err.print();
@@ -140,15 +174,19 @@ impl Cli {
         }
     }
 
-    /// Dispatches the parsed options to the appropriate stub handler.
+    /// Dispatches the parsed options to the appropriate handler by resolved [`Mode`].
+    ///
+    /// Returns the [`ExitStatus`] outcome; [`Self::main`] applies the thin
+    /// [`ExitStatus::code`] wrapper to turn it into a process [`ExitCode`].
+    /// Returning the richer status (rather than an already-collapsed `ExitCode`)
+    /// keeps dispatch routing directly assertable in tests.
     #[must_use]
-    fn run(self) -> ExitCode {
-        let status = if self.scan {
-            self.run_scan()
-        } else {
-            self.run_mutation()
-        };
-        status.code()
+    fn run(self) -> ExitStatus {
+        match Mode::resolve(&self) {
+            Mode::Scan => self.run_scan(),
+            Mode::UpdateManifest => self.run_update_manifest(),
+            Mode::Mutate => self.run_mutation(),
+        }
     }
 
     /// Stub for `--scan` mode (site counting lands in S2 / T6).
@@ -158,6 +196,48 @@ impl Cli {
             self.file.display()
         );
         ExitStatus::Success
+    }
+
+    /// Refreshes the sidecar manifest (`<file>.rs.m4r.toml`) from the target file.
+    ///
+    /// Reading the source from disk is infrastructure work done here; the parsed
+    /// text is then handed to the pure [`manifest::function_hashes`] seam. Any
+    /// I/O or parse failure maps onto [`ExitStatus::Error`] (C11: exit `1`).
+    fn run_update_manifest(&self) -> ExitStatus {
+        match self.update_manifest() {
+            Ok(count) => {
+                println!(
+                    "mutate4rust: wrote manifest for {} ({count} functions).",
+                    self.file.display()
+                );
+                ExitStatus::Success
+            }
+            Err(err) => {
+                eprintln!("mutate4rust: {err:#}");
+                ExitStatus::Error
+            }
+        }
+    }
+
+    /// Computes per-function hashes for the target file and writes the sidecar,
+    /// returning the number of functions recorded.
+    fn update_manifest(&self) -> anyhow::Result<usize> {
+        let source = std::fs::read_to_string(&self.file)
+            .with_context(|| format!("failed to read source `{}`", self.file.display()))?;
+        let functions = manifest::function_hashes(&source)?;
+        let last_run = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs();
+        let count = functions.len();
+        let manifest = Manifest {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            hasher: INTERIM_HASHER_ID.to_owned(),
+            last_run,
+            functions,
+        };
+        manifest::write(&manifest::sidecar_path(&self.file), &manifest)?;
+        Ok(count)
     }
 
     /// Stub for a normal mutation run (the mutate loop lands in S3).
@@ -337,5 +417,55 @@ mod tests {
     fn exit_status_codes_match_contract() {
         assert_eq!(ExitStatus::Success.raw_code(), 0);
         assert_eq!(ExitStatus::Error.raw_code(), 1);
+    }
+
+    /// Mode resolution honours the deterministic precedence: `--scan` wins over
+    /// `--update-manifest`, which wins over a plain mutation run.
+    #[test]
+    fn mode_resolution_follows_precedence() {
+        let scan = Cli::try_parse_from(["mutate4rust", "a.rs", "--scan"]).unwrap();
+        assert_eq!(Mode::resolve(&scan), Mode::Scan);
+
+        let update = Cli::try_parse_from(["mutate4rust", "a.rs", "--update-manifest"]).unwrap();
+        assert_eq!(Mode::resolve(&update), Mode::UpdateManifest);
+
+        let mutate = Cli::try_parse_from(["mutate4rust", "a.rs"]).unwrap();
+        assert_eq!(Mode::resolve(&mutate), Mode::Mutate);
+
+        let both =
+            Cli::try_parse_from(["mutate4rust", "a.rs", "--scan", "--update-manifest"]).unwrap();
+        assert_eq!(Mode::resolve(&both), Mode::Scan);
+    }
+
+    /// `--update-manifest` end-to-end **through dispatch**: parses the flag and
+    /// drives [`Cli::run`] (not the handler directly), proving `run()` routes
+    /// `Mode::UpdateManifest`. Asserts the returned status is `Success` and that a
+    /// sidecar is created beside the source that re-reads into a `Manifest` with a
+    /// non-empty `functions` map. The temp dir is RAII-cleaned even on panic.
+    #[test]
+    fn update_manifest_writes_readable_sidecar() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_path = dir.path().join("target.rs");
+        std::fs::write(
+            &source_path,
+            "fn a(x: i32, y: i32) -> i32 { x + y }\nfn b(x: i32, y: i32) -> i32 { x - y }\n",
+        )
+        .expect("seed source file");
+
+        let cli = Cli::try_parse_from([
+            "mutate4rust",
+            source_path.to_str().unwrap(),
+            "--update-manifest",
+        ])
+        .unwrap();
+        let status = cli.run();
+
+        assert_eq!(status, ExitStatus::Success);
+
+        let sidecar = manifest::sidecar_path(&source_path);
+        let recorded = manifest::read(&sidecar)
+            .expect("sidecar should read")
+            .expect("sidecar should exist beside the source");
+        assert!(!recorded.functions.is_empty());
     }
 }

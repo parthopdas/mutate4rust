@@ -87,7 +87,7 @@ One or more tasks per slice.
 | T2  | S1 | clap CLI: positional `<FILE>` + all parity flags (parse only, wired to stubs); `--help`/`--version`; snapshot test; exit-code contract. | Done | ✅ |
 | T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Done | ✅ |
 | T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Done | ✅ |
-| T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Pending | - |
+| T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Done | ✅ |
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Pending | - |
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Pending | - |
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Pending | - |
@@ -327,6 +327,49 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     operators (arm-body swap needs two spans; `Some(x)→None`, `expr?→expr.unwrap()` replace a subtree).
     Generalize the model then (YAGNI until T13) — don't assume single-token splice is the whole
     contract.
+- **T5 — APPROVE-WITH-SUGGESTIONS** (no blockers). Manifest (`src/manifest.rs`, infra adapter) +
+  `Mode` wiring are well-shaped: behavior-preserving scanner refactor, fs I/O correctly in the infra
+  layer, deterministic `BTreeMap`/byte-identical TOML, and it **closes the design.md latent gap**
+  (`--update-manifest` now routes to a real `Mode::UpdateManifest`, not the mutate stub). Carry-forward
+  (c) holds — `byte_span` is never persisted (key = `function_id`, value = hash). One hedge was landed
+  in T5 before commit (below); the rest are T14/T15 decisions owed to the human.
+  - **LANDED IN T5 (Anders' item 1):** added a **schema/version marker** to the manifest —
+    `schema_version: u32` (`CURRENT_SCHEMA_VERSION = 1`) + `hasher: String`
+    (`INTERIM_HASHER_ID = "interim-defaulthasher-v0"`), both `#[serde(default)]` backward-compatible,
+    serialized top-of-file before `[functions]`. Rationale: the interim `DefaultHasher` is **not stable
+    across Rust releases (R7)** and the T14 normalized-hash swap changes every stored hash with no
+    structural change — the marker lets a consumer detect incompatibility (treat as full-run) instead
+    of silently mis-reading. Landed now because **T6 is the first consumer** of these hashes.
+  - **T14 MUST-FIX — `function_id` uniqueness is now a CORRECTNESS bug (promoted from cosmetic).** In
+    the manifest, colliding ids mean `BTreeMap::insert` **overwrites** — one function's hash silently
+    wins, so a change to the other is invisible to differential selection. Fix `self_ty_name` to
+    include the trait ident + disambiguate overlapping impls before differential goes live. NOTE: the
+    `function_hash_keys_match_scanner_function_ids` test does **not** guard this (scanner+manifest
+    agree *because* they collide identically).
+  - **T14 hash-swap granularity:** the seam swap is NOT just replacing `hash_slice` — `record` keeps
+    only the span/string; normalized token-reprint needs the syn **node/tokens**. Expect to retype
+    `record`/`hash_slice` to take `ToTokens` and touch all three `visit_*_fn` methods (all
+    `pub(crate)`/private — no contract break).
+  - **T14 invariant nuance:** the true relationship is `manifest_keys ⊇ scanner_function_ids` (manifest
+    hashes **every** named fn; scanner emits ids only for fns containing a site). Equality holds only on
+    curated fixtures. T14 differential must rely on the **superset** relation — a siteless `fn empty(){}`
+    is hashed but has no scanner id and is NOT an invariant violation.
+  - **T14/T15 — file-level (`None`-function) sites owe an explicit decision:** module-level /
+    associated-`const` sites have no manifest home; differential will treat them as always-mutated or
+    never-mutated by default. Decide explicitly (always-in vs. synthetic file-level hash bucket) — a
+    human/product-adjacent design call, not a silent default.
+  - **T14 (nice-to-have first):** move shared id-derivation (`Frame`/`scope_path`/`self_ty_name`) out of
+    `scanner` (a Core module now imported *back* by infra `manifest`) into a dedicated pure module
+    (e.g. `scope`/`function_id`) so the shared identity scheme has one obviously-shared home and the
+    uniqueness fix lands in one place.
+  - **T6:** `--scan` changed-count must read via `manifest::read` and tolerate `Ok(None)` (first run)
+    as "all changed / stub 0 per plan" — absence is NOT an error (C11). Rely on `manifest_keys ⊇
+    scanner_ids`, not equality.
+  - **T15:** confirm mtime-vs-`last_run` direction against upstream (source mtime > `last_run` ⇒
+    changed); `last_run` bumps on every `--update-manifest` even with no change → committed-sidecar
+    churn (upstream parity — make it a conscious call). Land clap `ArgGroup` mutual-exclusivity
+    resolving conflicts to **exit 1 BEFORE any manifest write** (so a mis-flagged invocation never
+    mutates a sidecar then errors).
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any

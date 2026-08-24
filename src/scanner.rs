@@ -35,7 +35,11 @@ pub fn scan_source(source: &str) -> Result<Vec<Site>> {
 /// A lexical scope pushed while walking. Functions contribute to a site's
 /// `function_id`; modules and impl/trait types only *qualify* a nested function's
 /// path, they do not by themselves make a site "inside a function".
-enum Frame {
+///
+/// `pub(crate)` so the manifest seam ([`crate::manifest`]) can reuse the exact
+/// same scope-stack scheme, keeping its per-function keys identical to the
+/// scanner's [`Site::function_id`](crate::site::Site::function_id).
+pub(crate) enum Frame {
     /// A function/method body — sites directly inside belong to this function.
     Function(String),
     /// A non-function qualifier (module, impl self-type, or trait) that prefixes a
@@ -44,11 +48,22 @@ enum Frame {
 }
 
 impl Frame {
-    fn segment(&self) -> &str {
+    pub(crate) fn segment(&self) -> &str {
         match self {
             Frame::Function(name) | Frame::Qualifier(name) => name,
         }
     }
+}
+
+/// Joins the enclosing scope segments into a `::`-separated path (e.g.
+/// `S::method::nested`). Shared with [`crate::manifest`] so function identity is
+/// derived one way only.
+pub(crate) fn scope_path(scope: &[Frame]) -> String {
+    scope
+        .iter()
+        .map(Frame::segment)
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 /// Immutable-visitor state: the collected sites plus the enclosing scope stack.
@@ -71,13 +86,7 @@ impl SiteCollector {
     /// function.
     fn function_id(&self) -> Option<String> {
         match self.scope.last() {
-            Some(Frame::Function(_)) => Some(
-                self.scope
-                    .iter()
-                    .map(Frame::segment)
-                    .collect::<Vec<_>>()
-                    .join("::"),
-            ),
+            Some(Frame::Function(_)) => Some(scope_path(&self.scope)),
             _ => None,
         }
     }
@@ -184,7 +193,9 @@ fn constant_operator(lit: &syn::LitInt) -> Option<Operator> {
 
 /// Best-effort simple name of an `impl` self-type for path qualification (e.g.
 /// `Foo` from `impl Foo`). Non-path types fall back to `_`.
-fn self_ty_name(ty: &syn::Type) -> String {
+///
+/// `pub(crate)` so [`crate::manifest`] resolves impl qualifiers identically.
+pub(crate) fn self_ty_name(ty: &syn::Type) -> String {
     match ty {
         syn::Type::Path(type_path) => type_path
             .path
