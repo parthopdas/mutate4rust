@@ -86,7 +86,7 @@ One or more tasks per slice.
 | T1  | S1 | `cargo init` binary crate `mutate4rust`; deps (`clap`, `syn` w/ full+span features, `proc-macro2`, `anyhow`, `toml`, `serde`); trivial lib fn + unit test so gates pass. | Done | ✅ |
 | T2  | S1 | clap CLI: positional `<FILE>` + all parity flags (parse only, wired to stubs); `--help`/`--version`; snapshot test; exit-code contract. | Done | ✅ |
 | T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Done | ✅ |
-| T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Pending | - |
+| T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Done | ✅ |
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Pending | - |
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Pending | - |
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Pending | - |
@@ -301,6 +301,32 @@ and reported separately. Full parity with mutate4go's bucket assignment.
   are 1:1 parity, score is not — upstream emits raw counts); (3) forward-pointer that future CLI
   mutual-exclusivity violations also resolve to exit `1` under C11. C11 exit-code correction in
   `src/cli.rs` verified faithful (0=success-incl-survivors / 1=any-error; clap usage `2`→`1`).
+- **T4 — APPROVE-WITH-SUGGESTIONS** (no blockers). Site model (`src/site.rs`) + `scan_source`
+  (`src/scanner.rs`) are architecturally sound, correctly scoped to the T4 in-scope operator set, and
+  land on the right side of the pure-core boundary (both modules `use` only `syn`/`proc-macro2`/
+  `anyhow` — no fs/process/argv/clap; `scan_source(&str)` takes source text, not a path). Immutable
+  `Visit` + operator-token `byte_span` splice strategy confirmed correct (never `syn`-reprinted; C6/R2
+  posture). `function_id` is name-based (invariant under reordering/insertion) — the right identity
+  choice. T4/T5 feature-flag caveat now satisfied (`visit`, `spanned`, `byte_range()` all
+  compile-exercised). Carry-forward notes:
+  - **T14 (must-fix before differential):** `function_id` is **not unique** — `self_ty_name` keys impl
+    blocks on the self-type's last path segment only and drops the trait, so `impl Display for S::fmt`
+    and `impl Debug for S::fmt` collide, as do inherent vs. trait `S::f`, `Wrapper<i32>` vs.
+    `Wrapper<u8>`, and non-path self-types (`_::method`). Two functions sharing one id collide in the
+    per-function manifest map → missed mutations / differential churn. Fix is localized to
+    `visit_item_impl`/`self_ty_name` (fold the trait into the qualifier, e.g. `<S as Display>::fmt`).
+    Does not invalidate the T4 model.
+  - **T5/T14:** define a differential strategy for `function_id == None` sites (module-level /
+    associated `const` have no manifest home — e.g. synthetic file-level bucket); document explicitly
+    that `byte_span` is **ephemeral run-local** and must **never** be persisted as manifest identity
+    (valid only against the exact in-memory snapshot it was scanned from).
+  - **T9:** constant mutation must **preserve literal suffix/radix** — constant sites carry the whole
+    literal token span (`1u8`, `0x1`), so a naive splice of `"0"` would drop the `u8` suffix and break
+    type inference/compile. Preserve suffix/radix (or narrow the span) in the constant mapping.
+  - **T13/S6:** the single-`byte_span`/single-`Operator` `Site` won't fit multi-span/structural
+    operators (arm-body swap needs two spans; `Some(x)→None`, `expr?→expr.unwrap()` replace a subtree).
+    Generalize the model then (YAGNI until T13) — don't assume single-token splice is the whole
+    contract.
 
 ### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
 **Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any

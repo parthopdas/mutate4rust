@@ -1,10 +1,13 @@
 //! `mutate4rust` core library.
 //!
-//! This crate hosts the mutation-testing engine. During the S1 bootstrap it only
-//! exposes a trivial helper so the build/test gates have real code to exercise;
-//! the discovery, mutation, and reporting pipeline lands in later slices.
+//! This crate hosts the mutation-testing engine. The [`site`] and [`scanner`]
+//! modules are the pure **Core/domain** layer (the mutation-site model and the
+//! `syn` site-discovery walk — no fs/process/argv/clap); [`cli`] is the outer
+//! infrastructure adapter. Coverage, mutation, and reporting land in later slices.
 
 pub mod cli;
+pub mod scanner;
+pub mod site;
 
 /// Returns the crate's package version, as declared in `Cargo.toml`.
 #[must_use]
