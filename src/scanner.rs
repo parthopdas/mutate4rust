@@ -17,7 +17,7 @@ use syn::visit::{self, Visit};
 
 use crate::site::{Operator, Site};
 
-/// Parses `source` as a Rust file and returns every T4-scope mutation site, in
+/// Parses `source` as a Rust file and returns every in-scope mutation site, in
 /// deterministic source order (depth-first, as visited).
 ///
 /// # Errors
@@ -161,13 +161,20 @@ impl<'ast> Visit<'ast> for SiteCollector {
     }
 }
 
-/// Maps a binary operator onto its T4-scope [`Operator`], or `None` for operators
-/// deferred to later slices (`/`, `%`, bitwise, shifts, compound assignment).
+/// Maps a binary operator onto its in-scope [`Operator`], or `None` for operators
+/// deferred to later slices (bitwise, shifts, and the assign-forms of those).
+///
+/// A compound assignment (`a += b`) arrives as an [`syn::ExprBinary`] whose
+/// `op` is the assign variant, and that op's span covers exactly the two-character
+/// operator token — not the whole assignment expression — which is what the
+/// byte-span splice requires.
 fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
     match op {
         syn::BinOp::Add(_) => Some(Operator::Add),
         syn::BinOp::Sub(_) => Some(Operator::Sub),
         syn::BinOp::Mul(_) => Some(Operator::Mul),
+        syn::BinOp::Div(_) => Some(Operator::Div),
+        syn::BinOp::Rem(_) => Some(Operator::Rem),
         syn::BinOp::Gt(_) => Some(Operator::Greater),
         syn::BinOp::Ge(_) => Some(Operator::GreaterEqual),
         syn::BinOp::Lt(_) => Some(Operator::Less),
@@ -176,6 +183,11 @@ fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
         syn::BinOp::Ne(_) => Some(Operator::NotEqual),
         syn::BinOp::And(_) => Some(Operator::And),
         syn::BinOp::Or(_) => Some(Operator::Or),
+        syn::BinOp::AddAssign(_) => Some(Operator::AddAssign),
+        syn::BinOp::SubAssign(_) => Some(Operator::SubAssign),
+        syn::BinOp::MulAssign(_) => Some(Operator::MulAssign),
+        syn::BinOp::DivAssign(_) => Some(Operator::DivAssign),
+        syn::BinOp::RemAssign(_) => Some(Operator::RemAssign),
         _ => None,
     }
 }
@@ -222,17 +234,17 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_parity_operators_only() {
-        // `/` is an idiomatic completion (S4), so it must NOT be discovered here.
+    fn arithmetic_parity_operators() {
+        // The three parity mappings must keep being discovered exactly as before
+        // S4 added `/` and `%` (regression guard on the mutate4go parity set).
         let source = concat!(
             "fn add(a: i32, b: i32) -> i32 { a + b }\n",
             "fn sub(a: i32, b: i32) -> i32 { a - b }\n",
             "fn mul(a: i32, b: i32) -> i32 { a * b }\n",
-            "fn div(a: i32, b: i32) -> i32 { a / b }\n",
         );
         let sites = scan(source);
 
-        assert_eq!(sites.len(), 3, "only +, -, * are in T4 scope");
+        assert_eq!(sites.len(), 3);
         assert!(sites.iter().all(|s| s.kind == SiteKind::Arithmetic));
         assert_eq!(sites[0].operator, Operator::Add);
         assert_eq!(span_text(source, &sites[0]), "+");
@@ -250,18 +262,35 @@ mod tests {
     }
 
     #[test]
-    fn deferred_operators_emit_no_sites() {
-        // Every operator deferred to a later slice — `%`, bitwise `& | ^`, shifts
-        // `<< >>`, and compound-assignment `+= -= *= /= %=` — must yield NO site.
-        // This locks the T4 scope boundary. Operands are non-literal params so no
-        // in-scope constant/boolean sites can sneak in.
+    fn arithmetic_idiomatic_completions_are_sites() {
+        // `/` and `%` are S4 arithmetic completions — discovered, single-char spans.
         let source = concat!(
+            "fn div(a: i32, b: i32) -> i32 { a / b }\n",
             "fn rem(a: i32, b: i32) -> i32 { a % b }\n",
-            "fn bit_and(a: i32, b: i32) -> i32 { a & b }\n",
-            "fn bit_or(a: i32, b: i32) -> i32 { a | b }\n",
-            "fn bit_xor(a: i32, b: i32) -> i32 { a ^ b }\n",
-            "fn shl(a: i32, b: i32) -> i32 { a << b }\n",
-            "fn shr(a: i32, b: i32) -> i32 { a >> b }\n",
+        );
+        let sites = scan(source);
+
+        assert_eq!(sites.len(), 2);
+        assert!(sites.iter().all(|s| s.kind == SiteKind::Arithmetic));
+        assert_eq!(sites[0].operator, Operator::Div);
+        assert_eq!(span_text(source, &sites[0]), "/");
+        assert_eq!(sites[1].operator, Operator::Rem);
+        assert_eq!(span_text(source, &sites[1]), "%");
+        assert_eq!(
+            sites
+                .iter()
+                .map(|s| s.function_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("div"), Some("rem")],
+        );
+    }
+
+    #[test]
+    fn compound_assignment_spans_cover_only_the_two_char_operator() {
+        // The splice replaces the span verbatim, so the span must be the `+=`
+        // token itself — never the whole `a += b` statement. Asserting both the
+        // span text and its exact byte offsets locks that down.
+        let source = concat!(
             "fn compound(mut a: i32, b: i32) {\n",
             "    a += b;\n",
             "    a -= b;\n",
@@ -272,10 +301,117 @@ mod tests {
         );
         let sites = scan(source);
 
+        let found: Vec<(Operator, &str)> = sites
+            .iter()
+            .map(|s| (s.operator, span_text(source, s)))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (Operator::AddAssign, "+="),
+                (Operator::SubAssign, "-="),
+                (Operator::MulAssign, "*="),
+                (Operator::DivAssign, "/="),
+                (Operator::RemAssign, "%="),
+            ],
+        );
+        assert!(sites.iter().all(|s| s.kind == SiteKind::CompoundAssignment
+            && s.function_id.as_deref() == Some("compound")),);
+        // Byte-exact: each span is the operator's own offset pair, width 2.
+        for (site, token) in sites.iter().zip(["+=", "-=", "*=", "/=", "%="]) {
+            let expected_start = source.find(token).expect("token is in the fixture");
+            assert_eq!(site.byte_span, expected_start..expected_start + 2);
+        }
+        assert_eq!(
+            sites.iter().map(|s| s.line).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5, 6],
+        );
+    }
+
+    #[test]
+    fn deferred_operators_emit_no_sites() {
+        // Operators deferred to S6 — bitwise `& | ^` and shifts `<< >>`, plus
+        // their assign forms — must yield NO site. This locks the S4 scope
+        // boundary. Operands are non-literal params so no in-scope
+        // constant/boolean sites can sneak in.
+        let source = concat!(
+            "fn bit_and(a: i32, b: i32) -> i32 { a & b }\n",
+            "fn bit_or(a: i32, b: i32) -> i32 { a | b }\n",
+            "fn bit_xor(a: i32, b: i32) -> i32 { a ^ b }\n",
+            "fn shl(a: i32, b: i32) -> i32 { a << b }\n",
+            "fn shr(a: i32, b: i32) -> i32 { a >> b }\n",
+            "fn bit_compound(mut a: i32, b: i32) {\n",
+            "    a &= b;\n",
+            "    a |= b;\n",
+            "    a ^= b;\n",
+            "    a <<= b;\n",
+            "    a >>= b;\n",
+            "}\n",
+        );
+        let sites = scan(source);
+
         assert!(
             sites.is_empty(),
-            "no deferred operator is in T4 scope, got {sites:?}",
+            "no deferred operator is in S4 scope, got {sites:?}",
         );
+    }
+
+    #[test]
+    fn float_literals_are_not_constant_sites() {
+        // Floats are in scope for S6/T13, not S4 — the scanner matches
+        // `syn::LitInt` only, so `0.0`/`1.0` must yield no site.
+        let source = concat!("fn zero() -> f64 { 0.0 }\n", "fn one() -> f32 { 1.0f32 }\n",);
+        let sites = scan(source);
+
+        assert!(sites.is_empty(), "floats are not S4 sites, got {sites:?}");
+    }
+
+    #[test]
+    fn s4_spans_and_mappings_compose_into_the_expected_mutant_source() {
+        // Composition proof for every new S4 row: the span the scanner reports,
+        // replaced by the operator's mapping, yields exactly these bytes.
+        for (source, expected) in [
+            (
+                "fn f(a: i32, b: i32) -> i32 { a / b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a * b }\n",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> i32 { a % b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a * b }\n",
+            ),
+            (
+                "fn f(mut a: i32, b: i32) { a += b; }\n",
+                "fn f(mut a: i32, b: i32) { a -= b; }\n",
+            ),
+            (
+                "fn f(mut a: i32, b: i32) { a -= b; }\n",
+                "fn f(mut a: i32, b: i32) { a += b; }\n",
+            ),
+            (
+                "fn f(mut a: i32, b: i32) { a *= b; }\n",
+                "fn f(mut a: i32, b: i32) { a /= b; }\n",
+            ),
+            (
+                "fn f(mut a: i32, b: i32) { a /= b; }\n",
+                "fn f(mut a: i32, b: i32) { a *= b; }\n",
+            ),
+            (
+                "fn f(mut a: i32, b: i32) { a %= b; }\n",
+                "fn f(mut a: i32, b: i32) { a *= b; }\n",
+            ),
+        ] {
+            let sites = scan(source);
+            assert_eq!(sites.len(), 1, "one site expected in `{source}`");
+            let site = &sites[0];
+            let replacement = crate::operators::replacement(site.operator, span_text(source, site))
+                .expect("mapping should succeed");
+            let mutated = format!(
+                "{}{replacement}{}",
+                &source[..site.byte_span.start],
+                &source[site.byte_span.end..],
+            );
+            assert_eq!(mutated, expected);
+        }
     }
 
     #[test]

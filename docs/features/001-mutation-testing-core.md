@@ -92,7 +92,7 @@ One or more tasks per slice.
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Done | ✅ |
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Done ✅ | cea810a |
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Done ✅ | 54d30e2 |
-| T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Pending | - |
+| T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Done ✅ | (this commit) |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map. | Pending | - |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Pending | - |
 | T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise, **float constants (`0.0↔1.0`)**; precondition-gated emission (A8-adjacent). | Pending | - |
@@ -519,6 +519,83 @@ and reported separately. Full parity with mutate4go's bucket assignment.
   - **T17 — process-tree / job-object kill still owed (from T8):** `child.kill()` reaps only `cargo`,
     leaving a hung grandchild test binary holding the `target/` build lock and stalling the *next*
     mutant in single-worker mode. Not fixed by T16 isolation.
+- **T10 — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S4 CLOSED — clear to proceed to S5/T11.** Clean,
+  minimal slice: 7 rows added to a data-shaped enum + one match arm each across three Core files, with
+  **zero churn** in `pipeline`/`apply`/`report`/`runner`/`cli`. Parity rows preserved byte-identical and
+  now guarded by a **non-tautological regression test rather than an exclusion assertion** — the right
+  inversion. All five T9 carry-forwards landed.
+  - **Zero pipeline change is genuine, not coincidence** — `mutate_sites` is parametric over `Operator`
+    and never over `SiteKind`, and `replacement` is total, so any *one-token → one-token* mutation flows
+    through **by construction**. That is the T9 decomposition paying out, and it pins the boundary: the
+    first non-single-token operator (T13) is the first that will touch `pipeline`. S4 was the correct
+    free-rider; **S6 will not be.**
+  - **`SiteKind::CompoundAssignment` — correct axis, keep it.** `SiteKind` is a taxonomy classifier
+    (derived via `Operator::kind()`, living in Core, authored by the feature file's class rows), not a
+    presentation concern; `+=` genuinely is a different site class from `a + b` (different arity of
+    effect, different equivalent-mutant profile, and S6 will reason about assign-forms as a class).
+  - **Equivalent-mutant guardrail is sufficient *as a guardrail*.** `every_mapping_changes_the_token`
+    proves no mapping is a syntactic no-op; it cannot prove semantic inequivalence (operand-dependent —
+    `x *= 1`, `x %= 1` — and undecidable in general). S4 owes nothing more **in code**; what it raises is
+    the stakes on T12's per-mutant records, since an equivalent mutant surfaces as an unactionable
+    location-less **Survived**.
+  - **R3 sharpened:** `/→*` *removes* a divide-by-zero (safe direction), but `*=→/=` **guarantees a new
+    division site at every `*=`**, `%=→*=` adds more, and all five compound ops inherit debug-mode
+    overflow panics. Under A8 each folds into **Killed** — score inflation with zero signal about test
+    quality, now systematic rather than incidental. Faithful to the accepted posture, so not blocking,
+    but it materially strengthens **D6** → human note below.
+  - **A5 unchanged in kind, sharpened in degree** — the reconciliation note already names the cause.
+    But a derived consequence is uncosted: `--mutation-warning`'s default **50 is a parity-inherited
+    constant applied to a non-parity site count**, so mutate4rust now trips it earlier than mutate4go on
+    identical source (S6 widens this again). → T17.
+  - **Keep the `match`; do NOT go data-driven.** 7 more variants are 7 more compiler-checked rows, and
+    `Zero`/`One` already escape any table (they call `mutate_int_literal`), as will S6's structural rows —
+    a table would immediately need an escape hatch and you would maintain both.
+  - **S3-close decisions have clean ground:** `float_literals_are_not_constant_sites` is a **scope pin,
+    not an obstruction** (T13 flips it exactly as T10 flipped `deferred_operators_emit_no_sites` —
+    *invert, don't delete* is now the repo's scope-boundary idiom); `MutationReport` untouched with no
+    parallel list bolted on.
+  - **S1 carry-forward (fold into T13, or a 5-line change now) — `every_mapping_changes_the_token` is
+    manually enumerated and therefore silently incomplete-able.** A new `Operator` variant forces a
+    compile error in `replacement` and `kind()` but **not** in the guardrail test — the row is simply
+    absent and the test still passes. Close it in Core: add `Operator::canonical_token(self) ->
+    &'static str` (exhaustive match) + `Operator::ALL: [Operator; N]`, and iterate `ALL` in the test.
+    `canonical_token` doubles as the rendering primitive T12 needs and retires the hand-kept pair list.
+  - **T11/S5 — `Uncovered` becomes real against a widened site set.** Compound-assignment sites sit
+    *inside statements*; region→line mapping (C8/R5) must be validated on a fixture where an `a += b;`
+    line is covered, confirming the site's `line` is the key used against the coverage map and that a
+    **multi-site line resolves consistently for all its sites**.
+  - **T11/S5 — R8 is an *environment* risk, not a code one.** Add `llvm-tools-preview` +
+    `cargo-llvm-cov` to `.github/workflows/ci.yml` **in T11, not T12**, and prove the **Windows leg
+    first, not last**; a missing tool must fail loudly with an install hint, never silently mutate
+    everything (A6).
+  - **T12/S5 — the per-mutant record carries three things, not two:** `file:line` + operator/kind +
+    outcome, **plus** enough to distinguish a *panic-killed* mutant from an *assertion-killed* one
+    (bucket stays Killed per A8; the record gains fidelity).
+  - **T12/S5 — make `Site.kind` a method, not a stored `pub` field.** It is fully derived from
+    `operator`, has **zero non-test consumers** today, and the `pub` struct literal bypasses
+    `Site::new`'s invariant. T12 is its first real consumer — convert to `pub fn kind(&self)` there
+    rather than growing a second reader of derivable state (folds into the S8 visibility cleanup).
+  - **T13/S6 — bitwise assign-forms are pinned but untabled.** `&=`, `|=`, `^=`, `<<=`, `>>=` are
+    asserted to emit no sites, but the S6 taxonomy lists only the non-assign bitwise mappings. Either add
+    the assign rows to the taxonomy or state explicitly that bitwise-assign stays out of MVP — don't let
+    a test be the only place the decision lives.
+  - **T17 — `--mutation-warning` default 50:** keep it and document the divergence, or scale it. A
+    conscious call, not a silent parity inherit.
+
+### ⚠ S5 slice-level items owed to the human (raised at S4 close)
+1. **R8 / external tool dependency** — S5 is the first slice that cannot run on a bare `cargo` install.
+   Confirm `cargo-llvm-cov` + `llvm-tools-preview` go into **both** CI legs at T11, and that a missing
+   tool is a hard exit-`1` with an install hint. This raises contributor onboarding cost.
+2. **A6 open edge — `--reuse-coverage` with no coverage file.** Flagged at design time for S5
+   verification against upstream; provisional answer is "error, ask the user to run coverage or drop the
+   flag". T11 is the moment to **verify, not guess**.
+3. **R3/D6 — panic-killed mutants inflate the score, and S4 made it systematic.** Options short of D6:
+   (a) do nothing, accept the current posture; (b) T12 records make panic-kills *visible* without
+   changing the bucket. Anders recommends **(b)** — near-zero cost inside work already planned, and it
+   tells you whether D6 is worth taking before committing to it.
+4. **Visibility only, not a decision:** after S6 the default run will be substantially further from
+   mutate4go's mutation count than A5's prose implies today. A5 stands; consider recording the expected
+   magnitude once S6 lands.
 
 ### S3 slice-level assumptions — awaiting human sign-off
 - **S3 mutates the user's real source file in place.** The only crash backstop is VCS (T7's documented
@@ -540,8 +617,7 @@ and reported separately. Full parity with mutate4go's bucket assignment.
    Requires a `syn::LitFloat` scanner arm + a float-aware constant mapping preserving `f32`/`f64`
    suffixes (`mutate_int_literal` will not stretch — separate path).
 
-### S3 slice-level assumptions — SIGNED OFF by the human at S3 close
-All three accepted as stated: (1) in-place mutation of the real source with VCS as the only crash
+### S3 slice-level assumptions — SIGNED OFF by the human at S3 closeAll three accepted as stated: (1) in-place mutation of the real source with VCS as the only crash
 backstop, and **no dirty-target guard** (explicitly declined as a task — revisit only if it bites);
 (2) `Uncovered` structurally present but always zero until S5; (3) baseline abort as a hard
 precondition (exit `1` on a red/hanging suite), knowingly **stricter than upstream mutate4go**.

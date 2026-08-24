@@ -7,20 +7,25 @@
 //! out of the original source using [`crate::site::Site::byte_span`] and splices
 //! the returned replacement back with [`crate::apply::splice`].
 //!
-//! # Scope — the S3 universal + arithmetic-**parity** set
+//! # Scope — the S3 universal + arithmetic-**parity** set, plus the S4
+//! arithmetic idiomatic completions
 //!
-//! | Class | Mapping |
-//! |-------|---------|
-//! | Arithmetic | `+ → -`; `- → +`; `* → /` |
-//! | Comparison | `> → >=`; `>= → >`; `< → <=`; `<= → <` |
-//! | Equality | `== → !=`; `!= → ==` |
-//! | Boolean literal | `true → false`; `false → true` |
-//! | Logical | `&& → \|\|`; `\|\| → &&` |
-//! | Constant | `0 → 1`; `1 → 0` |
+//! | Class | Mapping | Source |
+//! |-------|---------|--------|
+//! | Arithmetic | `+ → -`; `- → +`; `* → /` | parity |
+//! | Comparison | `> → >=`; `>= → >`; `< → <=`; `<= → <` | parity |
+//! | Equality | `== → !=`; `!= → ==` | parity |
+//! | Boolean literal | `true → false`; `false → true` | parity |
+//! | Logical | `&& → \|\|`; `\|\| → &&` | parity |
+//! | Constant | `0 → 1`; `1 → 0` | parity |
+//! | Arithmetic (division) | `/ → *` | idiomatic (S4) |
+//! | Arithmetic (remainder) | `% → *` | idiomatic (S4) |
+//! | Compound assignment | `+= → -=`; `-= → +=`; `*= → /=`; `/= → *=`; `%= → *=` | idiomatic (S4) |
 //!
-//! `/ → *`, `% → *`, and the compound-assignment operators are the S4 idiomatic
-//! completions and are deliberately absent here — the scanner does not emit those
-//! sites yet either.
+//! The three parity arithmetic mappings are **byte-identical to mutate4go** and
+//! must stay that way: S4 only *adds* the operators upstream never mutated. The
+//! resulting asymmetry is deliberate — `* → /` (parity) and `/ → *` (idiomatic)
+//! coexist, while `% → *` and `%= → *=` are one-way.
 //!
 //! # Integer literals keep their radix and suffix
 //!
@@ -61,6 +66,8 @@ pub(crate) fn replacement(operator: Operator, token: &str) -> Result<String> {
         Operator::Add => "-",
         Operator::Sub => "+",
         Operator::Mul => "/",
+        Operator::Div => "*",
+        Operator::Rem => "*",
         Operator::Greater => ">=",
         Operator::GreaterEqual => ">",
         Operator::Less => "<=",
@@ -71,6 +78,11 @@ pub(crate) fn replacement(operator: Operator, token: &str) -> Result<String> {
         Operator::Or => "&&",
         Operator::True => "false",
         Operator::False => "true",
+        Operator::AddAssign => "-=",
+        Operator::SubAssign => "+=",
+        Operator::MulAssign => "/=",
+        Operator::DivAssign => "*=",
+        Operator::RemAssign => "*=",
         Operator::Zero => return mutate_int_literal(token, 0, '1'),
         Operator::One => return mutate_int_literal(token, 1, '0'),
     };
@@ -154,10 +166,28 @@ mod tests {
 
     #[test]
     fn arithmetic_parity_mappings() {
-        // Parity subset only — `/` and `%` are S4 and have no Operator variant.
+        // Byte-identical to mutate4go — S4 must not have disturbed these.
         assert_eq!(map(Operator::Add, "+"), "-");
         assert_eq!(map(Operator::Sub, "-"), "+");
         assert_eq!(map(Operator::Mul, "*"), "/");
+    }
+
+    #[test]
+    fn arithmetic_idiomatic_completion_mappings() {
+        // Deliberately asymmetric: `* → /` (parity) and `/ → *` (idiomatic) both
+        // exist; `% → *` is one-way.
+        assert_eq!(map(Operator::Div, "/"), "*");
+        assert_eq!(map(Operator::Rem, "%"), "*");
+    }
+
+    #[test]
+    fn compound_assignment_mappings() {
+        // `+=`/`-=` are bidirectional; `*=`/`/=` swap; `%= → *=` is one-way.
+        assert_eq!(map(Operator::AddAssign, "+="), "-=");
+        assert_eq!(map(Operator::SubAssign, "-="), "+=");
+        assert_eq!(map(Operator::MulAssign, "*="), "/=");
+        assert_eq!(map(Operator::DivAssign, "/="), "*=");
+        assert_eq!(map(Operator::RemAssign, "%="), "*=");
     }
 
     #[test]
@@ -250,6 +280,8 @@ mod tests {
             (Operator::Add, "+"),
             (Operator::Sub, "-"),
             (Operator::Mul, "*"),
+            (Operator::Div, "/"),
+            (Operator::Rem, "%"),
             (Operator::Greater, ">"),
             (Operator::GreaterEqual, ">="),
             (Operator::Less, "<"),
@@ -262,6 +294,11 @@ mod tests {
             (Operator::False, "false"),
             (Operator::Zero, "0"),
             (Operator::One, "1"),
+            (Operator::AddAssign, "+="),
+            (Operator::SubAssign, "-="),
+            (Operator::MulAssign, "*="),
+            (Operator::DivAssign, "/="),
+            (Operator::RemAssign, "%="),
         ] {
             assert_ne!(map(operator, token), token, "{operator:?} is a no-op");
         }

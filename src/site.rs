@@ -10,14 +10,13 @@ use std::ops::Range;
 
 /// Taxonomy category of a mutation site.
 ///
-/// T4 discovers the **universal + arithmetic-parity** classes from the feature
-/// file's Operator Taxonomy (the S3 parity set). Each class maps to one or more
-/// concrete [`Operator`]s. Division/remainder, bitwise, shift, and
-/// compound-assignment operators are intentionally out of T4 scope (they arrive
-/// in S4/S6).
+/// The discovered classes are the feature file's **universal + arithmetic-parity**
+/// set (S3) plus the **arithmetic idiomatic completions** (S4: `/`, `%`, and the
+/// compound-assignment operators). Each class maps to one or more concrete
+/// [`Operator`]s. Bitwise and shift operators remain out of scope (S6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteKind {
-    /// Binary arithmetic operator — the parity subset `+`, `-`, `*`.
+    /// Binary arithmetic operator — `+`, `-`, `*` (parity) and `/`, `%` (S4).
     Arithmetic,
     /// Ordering comparison — `>`, `>=`, `<`, `<=`.
     Comparison,
@@ -29,6 +28,8 @@ pub enum SiteKind {
     Logical,
     /// Integer constant `0` or `1`.
     Constant,
+    /// Compound-assignment operator — `+=`, `-=`, `*=`, `/=`, `%=`.
+    CompoundAssignment,
 }
 
 /// The exact operator or token found at a site.
@@ -45,6 +46,10 @@ pub enum Operator {
     Sub,
     /// `*`
     Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Rem,
     /// `>`
     Greater,
     /// `>=`
@@ -69,6 +74,16 @@ pub enum Operator {
     Zero,
     /// integer literal `1`
     One,
+    /// `+=`
+    AddAssign,
+    /// `-=`
+    SubAssign,
+    /// `*=`
+    MulAssign,
+    /// `/=`
+    DivAssign,
+    /// `%=`
+    RemAssign,
 }
 
 impl Operator {
@@ -76,7 +91,9 @@ impl Operator {
     #[must_use]
     pub fn kind(self) -> SiteKind {
         match self {
-            Operator::Add | Operator::Sub | Operator::Mul => SiteKind::Arithmetic,
+            Operator::Add | Operator::Sub | Operator::Mul | Operator::Div | Operator::Rem => {
+                SiteKind::Arithmetic
+            }
             Operator::Greater | Operator::GreaterEqual | Operator::Less | Operator::LessEqual => {
                 SiteKind::Comparison
             }
@@ -84,6 +101,11 @@ impl Operator {
             Operator::And | Operator::Or => SiteKind::Logical,
             Operator::True | Operator::False => SiteKind::BooleanLiteral,
             Operator::Zero | Operator::One => SiteKind::Constant,
+            Operator::AddAssign
+            | Operator::SubAssign
+            | Operator::MulAssign
+            | Operator::DivAssign
+            | Operator::RemAssign => SiteKind::CompoundAssignment,
         }
     }
 }
@@ -143,6 +165,8 @@ mod tests {
         assert_eq!(Operator::Add.kind(), SiteKind::Arithmetic);
         assert_eq!(Operator::Sub.kind(), SiteKind::Arithmetic);
         assert_eq!(Operator::Mul.kind(), SiteKind::Arithmetic);
+        assert_eq!(Operator::Div.kind(), SiteKind::Arithmetic);
+        assert_eq!(Operator::Rem.kind(), SiteKind::Arithmetic);
         assert_eq!(Operator::Greater.kind(), SiteKind::Comparison);
         assert_eq!(Operator::GreaterEqual.kind(), SiteKind::Comparison);
         assert_eq!(Operator::Less.kind(), SiteKind::Comparison);
@@ -155,5 +179,10 @@ mod tests {
         assert_eq!(Operator::False.kind(), SiteKind::BooleanLiteral);
         assert_eq!(Operator::Zero.kind(), SiteKind::Constant);
         assert_eq!(Operator::One.kind(), SiteKind::Constant);
+        assert_eq!(Operator::AddAssign.kind(), SiteKind::CompoundAssignment);
+        assert_eq!(Operator::SubAssign.kind(), SiteKind::CompoundAssignment);
+        assert_eq!(Operator::MulAssign.kind(), SiteKind::CompoundAssignment);
+        assert_eq!(Operator::DivAssign.kind(), SiteKind::CompoundAssignment);
+        assert_eq!(Operator::RemAssign.kind(), SiteKind::CompoundAssignment);
     }
 }
