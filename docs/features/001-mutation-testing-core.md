@@ -85,7 +85,7 @@ One or more tasks per slice.
 |----|-------|------|--------|--------|
 | T1  | S1 | `cargo init` binary crate `mutate4rust`; deps (`clap`, `syn` w/ full+span features, `proc-macro2`, `anyhow`, `toml`, `serde`); trivial lib fn + unit test so gates pass. | Done | ✅ |
 | T2  | S1 | clap CLI: positional `<FILE>` + all parity flags (parse only, wired to stubs); `--help`/`--version`; snapshot test; exit-code contract. | Done | ✅ |
-| T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Pending | - |
+| T3  | S1 | Replace `docs/design.md` FILL_ME stub with real high-level design (overview, layers, components, cross-cutting, conventions). | Done | ✅ |
 | T4  | S2 | `syn`/`proc-macro2` parse + mutation-site model (kind, byte span, line, function id). | Pending | - |
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Pending | - |
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Pending | - |
@@ -293,8 +293,22 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     at the boundary); model scan/update-manifest/mutate as a **`Mode` enum** resolved at the boundary
     (note latent gap: `run()` currently routes `--update-manifest` into the mutation stub).
   - Optional: `--reuse-lcov` alias for strict parity with upstream's synonym.
+- **T3 — APPROVE-WITH-SUGGESTIONS** (no blockers; commit not gated). `docs/design.md` is correct,
+  crisp, usable as the reloaded SSOT; inward dependency-flow rule, CLI→`RunConfig`→pipeline seam,
+  `Mode` enum, key components, and the C11 exit-code parity contract all documented faithfully. Three
+  doc-only polish items were applied before commit: (1) pipeline arrow now includes the trailing
+  `→ manifest` stage; (2) numeric score clarified as an **additive** mutate4rust extension (buckets
+  are 1:1 parity, score is not — upstream emits raw counts); (3) forward-pointer that future CLI
+  mutual-exclusivity violations also resolve to exit `1` under C11. C11 exit-code correction in
+  `src/cli.rs` verified faithful (0=success-incl-survivors / 1=any-error; clap usage `2`→`1`).
 
-### Product decision — exit codes (C11) — PENDING HUMAN
-mutate4go: `0` = ran OK **incl. survivors**, `1` = any error. Proposed mutate4rust:
-`0` success / `1` survivors / `2` usage / `3` error. Awaiting human sign-off before S3/T8 returns the
-non-zero variants; T3's design.md will document whichever is chosen.
+### Product decision — exit codes (C11) — RESOLVED: strict mutate4go parity
+**Human decision:** strict parity. Exit `0` = ran OK **including surviving mutants**; exit `1` = **any
+error** (usage OR operational). mutate4rust does **NOT** fail CI on survivors — survivors are reported,
+not signalled via exit code — matching mutate4go exactly. Implications:
+- The T2 stub contract (`0/1/2/3`) is **superseded**: collapse usage+operational → `1`; survivors do
+  not affect the exit code. clap's default usage exit (2) is overridden to `1` for parity.
+- Corrected in `src/cli.rs` alongside T3 (S1 close); `docs/design.md` (T3) documents the parity
+  contract.
+- Guardrail note: users wanting CI-fail-on-survivors read the reported survivor count; a future
+  opt-in `--fail-on-survivors` flag is a candidate deferral (not now).

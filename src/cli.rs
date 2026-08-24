@@ -19,30 +19,23 @@ use clap::Parser;
 /// Default mutation-count warning threshold (feature file `--scan`/T6 note).
 const DEFAULT_MUTATION_WARNING: usize = 50;
 
-/// Exit-code contract for `mutate4rust`, used as a CI guardrail.
+/// Exit-code contract for `mutate4rust` — **strict mutate4go parity** (decision C11).
 ///
 /// The codes are stable and documented so pipelines can branch on them:
 ///
-/// - `0` — **success**: the run (or scan) completed with no surviving mutants
-///   (every covered mutant was killed, or there was nothing to report).
-/// - `1` — **survivors**: mutation testing completed but at least one mutant
-///   survived; the guardrail fails so CI can block the change.
-/// - `2` — **usage**: invalid command-line usage. Emitted by `clap` itself when
-///   argument parsing fails (this variant is not produced by our own code).
-/// - `3` — **error**: an operational failure (file I/O, `syn` parse, coverage
-///   tooling, or the test runner) prevented the run from completing.
+/// - `0` — **success**: the run (or scan) completed. This **includes runs where
+///   mutants survive** — survivors are reported, not signalled by the exit code
+///   (mutate4rust does *not* fail CI on survivors).
+/// - `1` — **error**: any failure — invalid command-line usage *and* operational
+///   failures (file I/O, `syn` parse, coverage tooling, or the test runner) both
+///   map here. Upstream `runner.StatusCode` returns 1 on any error and does not
+///   distinguish usage from operational; clap's default usage exit (`2`) is
+///   overridden to `1` (see [`Cli::main`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// `Survivors`/`Error` are part of the documented exit-code contract but are only
-// produced from later slices; the S1 stubs return `Success`. `allow` (rather than
-// `expect`) is required because the test build *does* construct them, so the
-// expectation would be unfulfilled there.
-#[allow(dead_code)]
 enum ExitStatus {
-    /// No surviving mutants — the guardrail passes.
+    /// The run completed — surviving mutants are reported, not signalled here.
     Success,
-    /// At least one mutant survived — the guardrail fails.
-    Survivors,
-    /// An operational error prevented completion.
+    /// Any failure — usage or operational.
     Error,
 }
 
@@ -51,8 +44,7 @@ impl ExitStatus {
     fn raw_code(self) -> u8 {
         match self {
             ExitStatus::Success => 0,
-            ExitStatus::Survivors => 1,
-            ExitStatus::Error => 3,
+            ExitStatus::Error => 1,
         }
     }
 
@@ -121,11 +113,31 @@ pub struct Cli {
 impl Cli {
     /// Parses process arguments and runs the CLI, returning a process exit code.
     ///
-    /// `clap` handles `--help`/`--version` and usage errors internally (exiting
-    /// with code `2` on bad usage); everything else flows through [`Self::run`].
+    /// `clap` serves `--help`/`--version` itself. On a **usage error** clap would
+    /// normally exit with code `2`; for strict mutate4go parity (decision C11) we
+    /// intercept parsing and map any usage error onto exit `1`, while help/version
+    /// still exit `0`. Successful parses flow through [`Self::run`].
     #[must_use]
     pub fn main() -> ExitCode {
-        Self::parse().run()
+        match Self::try_parse() {
+            Ok(cli) => cli.run(),
+            Err(err) => {
+                // Renders the message (stderr for errors, stdout for help/version).
+                let _ = err.print();
+                Self::exit_status_for_parse_error(&err).code()
+            }
+        }
+    }
+
+    /// Maps a clap parse outcome onto the parity exit-code contract: help/version
+    /// requests are a clean `Success` (0); every genuine usage error is `Error`
+    /// (1), overriding clap's default usage code of `2`.
+    fn exit_status_for_parse_error(err: &clap::Error) -> ExitStatus {
+        if err.use_stderr() {
+            ExitStatus::Error
+        } else {
+            ExitStatus::Success
+        }
     }
 
     /// Dispatches the parsed options to the appropriate stub handler.
@@ -234,25 +246,30 @@ mod tests {
         assert!(cli.verbose);
     }
 
-    /// The positional `<FILE>` is required; omitting it is a usage error.
+    /// The positional `<FILE>` is required; omitting it is a usage error that,
+    /// per strict mutate4go parity (C11), maps onto exit code `1` (not clap's
+    /// default `2`).
     #[test]
     fn missing_file_is_a_usage_error() {
         let err = Cli::try_parse_from(["mutate4rust"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert_eq!(Cli::exit_status_for_parse_error(&err).raw_code(), 1);
     }
 
-    /// `--help` is served by clap (not treated as a run).
+    /// `--help` is served by clap (not treated as a run) and exits `0`.
     #[test]
     fn help_flag_is_handled_by_clap() {
         let err = Cli::try_parse_from(["mutate4rust", "--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert_eq!(Cli::exit_status_for_parse_error(&err).raw_code(), 0);
     }
 
-    /// `--version` is served by clap and reports the crate version.
+    /// `--version` is served by clap and reports the crate version, exiting `0`.
     #[test]
     fn version_flag_is_handled_by_clap() {
         let err = Cli::try_parse_from(["mutate4rust", "--version"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(Cli::exit_status_for_parse_error(&err).raw_code(), 0);
     }
 
     /// Deterministic snapshot of the *rendered* `--help` surface.
@@ -314,11 +331,11 @@ mod tests {
         );
     }
 
-    /// The exit-code contract maps outcomes onto the documented process codes.
+    /// The exit-code contract maps outcomes onto the documented process codes:
+    /// success (incl. surviving mutants) is `0`, any error is `1` (C11 parity).
     #[test]
     fn exit_status_codes_match_contract() {
         assert_eq!(ExitStatus::Success.raw_code(), 0);
-        assert_eq!(ExitStatus::Survivors.raw_code(), 1);
-        assert_eq!(ExitStatus::Error.raw_code(), 3);
+        assert_eq!(ExitStatus::Error.raw_code(), 1);
     }
 }
