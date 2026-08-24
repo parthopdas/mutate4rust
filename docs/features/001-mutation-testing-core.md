@@ -8,7 +8,7 @@ Port `unclebob/mutate4go` to an idiomatic Rust CLI, `mutate4rust`, that operates
 file at a time** and:
 
 - Discovers mutation sites in a `.rs` file, applies each mutation, runs the crate's tests, and
-  reports **killed / survived / invalid / uncovered** mutants.
+  reports **killed / survived / uncovered** mutants.
 - Uses coverage to mutate only covered sites (uncovered sites are reported, not executed).
 - Maintains a per-file manifest (last-run date + per-function hashes) to drive **differential**
   mutation ("changed functions only") on subsequent runs.
@@ -66,7 +66,7 @@ high-level design.
 |-------|---------|------------|
 | S1 | **Bootstrap**: Cargo binary crate `mutate4rust`; CLI skeleton parsing the full parity flag surface (wired to stubs); `--help`/`--version`; all profile gates green (`cargo build`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test`); **replace `docs/design.md` stub with real high-level design**. E2E: `mutate4rust --help` lists flags; gates pass. | - |
 | S2 | Discovery & scan: `syn`-based mutation-site model, `--scan` (site + changed-site counts + mutation-warning), sidecar manifest read/write scaffold, `--update-manifest`. | S1 |
-| S3 | Core mutate loop + universal & arithmetic-**parity** operators: byte-span apply/restore, `cargo test` runner with timeout, killed/survived/invalid/uncovered report. Operators = the mutate4go set. | S2 |
+| S3 | Core mutate loop + universal & arithmetic-**parity** operators: byte-span apply/restore, `cargo test` runner with timeout, killed/survived/uncovered report. Operators = the mutate4go set. | S2 |
 | S4 | Arithmetic-family **idiomatic completion**: `/→*`, `%→*`, and compound-assignment operators. | S3 |
 | S5 | Coverage integration: `cargo-llvm-cov`, covered-only execution, uncovered reporting/skip, `--reuse-coverage`, coverage-absent parity behavior. | S3 |
 | S6 | **Rust-specific operators** (idiomatic, active by default): `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise. | S3 |
@@ -90,8 +90,8 @@ One or more tasks per slice.
 | T5  | S2 | Sidecar manifest (`<file>.rs.m4r.toml`) schema + read/write; `--update-manifest`. | Pending | - |
 | T6  | S2 | `--scan` mode: total sites, changed sites vs manifest (stub 0 until S7), mutation-count warning (default 50). | Pending | - |
 | T7  | S3 | Byte-span mutant apply + guaranteed restore (in-memory original; restore even on panic). | Pending | - |
-| T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/timeout/invalid. | Pending | - |
-| T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (5-line report). | Pending | - |
+| T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Pending | - |
+| T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Pending | - |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Pending | - |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map. | Pending | - |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6). | Pending | - |
@@ -154,9 +154,9 @@ same way); **idiomatic** entries are Rust-native additions. All are **active by 
 - R3: **Rust arithmetic panics.** Debug builds panic on overflow, `*→/` can divide-by-zero — may
   trivially kill arithmetic mutants and diverge debug vs release. Accept parity default (debug
   `cargo test`); release/overflow toggle deferred (D6).
-- R4: **Non-compiling mutants** waste a compile and need a definitive classification. Mitigated:
-  `invalid` is surfaced for visibility but scored as killed-equivalent, so parity with mutate4go's
-  bucket assignment (and thus any derived score) is preserved (A8).
+- R4: **Non-compiling mutants** waste a compile. Per Go parity they are counted as **killed** (a
+  broken build fails the test command, non-zero exit), matching mutate4go exactly (A8). Precondition
+  gating (taxonomy note) avoids emitting knowingly-broken mutants where feasible.
 - R5: **llvm-cov region→line fidelity.** Region coverage mapped to lines may mis-mark sites as
   uncovered; validate mapping against known-covered fixtures (S5).
 - R6: **Worker isolation.** Parallel workers need isolated `target/`/source copies (seeded from a
@@ -191,15 +191,14 @@ same way); **idiomatic** entries are Rust-native additions. All are **active by 
   `--reuse-coverage`). Do not guess silently.
 - A7: Manifest is a **committed TOML sidecar** `<file>.rs.m4r.toml` next to the source (decision #1),
   diverging from upstream's embedded footer manifest.
-- A8: **Non-compiling mutants** are recorded in a distinct **`invalid`** bucket in the report
-  (upstream `mutate4go` has no such bucket — it folds these into `killed`). For scoring we **retain
-  parity with mutate4go**: `invalid` is treated as **killed-equivalent**. Mutation score =
-  `(killed + timeout + invalid) / (killed + timeout + invalid + survived)`; `uncovered` is excluded
-  from the score and reported separately, matching upstream semantics. Net effect: our numeric score
-  equals mutate4go's on identical inputs; the only difference is that `invalid` is itemized rather
-  than hidden inside `killed`. *(Verified against `unclebob/mutate4go` `internal/runner/runner.go`
-  `runMutant`/`summarize`.)* Note: upstream prints counts, not a percentage — so the score % is a
-  net-new addition; parity is guaranteed at the bucket-assignment level.
+- A8: **Non-compiling mutants** are counted as **`killed`**, in full parity with mutate4go: a broken
+  build fails the test command (non-zero exit) and upstream classifies that as killed. **No separate
+  `invalid` bucket.** Report buckets = **Killed / Survived / Uncovered** (timeout also folded into
+  killed, per upstream); score = `killed / (killed + survived)`, with `uncovered` excluded and
+  reported separately. *(Verified against `unclebob/mutate4go` `internal/runner/runner.go`
+  `runMutant`/`summarize`.)* Precondition-failing operator sites are still not emitted (taxonomy
+  note) to avoid wasting compiles on knowingly-broken mutants — but any that slip through and fail to
+  compile are scored as killed.
 
 ## Deferrals (Dx)
 
@@ -224,13 +223,13 @@ same way); **idiomatic** entries are Rust-native additions. All are **active by 
 3. **Coverage-absent = mutate4go parity**, pinned to verified upstream behavior (A6); the
    `--reuse-coverage`-without-coverage edge is flagged for S5 verification, not guessed.
 4. **Feature = `001-mutation-testing-core`**, branch `vibe/001-mutation-testing-core`.
-5. **A8 non-compiling mutants = distinct `invalid` bucket, scored killed-equivalent** to preserve
-   mutate4go score parity.
+5. **A8 non-compiling mutants = counted as `killed`** (full mutate4go parity; no separate `invalid`
+   bucket).
 
 ### Report shape
-Five lines — **Killed / Survived / Invalid / Timeout / Uncovered**. The score counts `invalid` and
-`timeout` as kills and omits `uncovered`, so the headline percentage stays parity-equal to mutate4go's
-bucket assignment.
+Three buckets — **Killed / Survived / Uncovered** (timeout and non-compiling folded into Killed,
+exactly as mutate4go). Score = `killed / (killed + survived)`; `uncovered` is excluded from the score
+and reported separately. Full parity with mutate4go's bucket assignment.
 
 ### Conflict-resolution summary (C1–C10 outcomes)
 | # | Conflict (mutate4go/Go assumption) | Resolution for mutate4rust |
@@ -250,9 +249,9 @@ bucket assignment.
 - **Unit:** operator mapping correctness (each taxonomy row → expected mutated bytes); site discovery
   on fixtures; manifest read/write + normalized hashing stability; coverage region→line mapping;
   differential selection (changed vs unchanged functions); mutant apply/restore round-trip;
-  classification (killed/survived/timeout/invalid) incl. the score formula.
+  classification (killed incl. timeout & non-compiling / survived / uncovered) incl. the score formula.
 - **Integration (critical paths only):** end-to-end single-file run (discover → coverage → mutate →
-  test → report) on a tiny fixture crate with a known killed/survived/invalid/uncovered outcome;
+  test → report) on a tiny fixture crate with a known killed/survived/uncovered outcome;
   `--scan` counts; `--reuse-coverage` and coverage-absent behavior (A6); one `--max-workers > 1` run
   for worker isolation. Avoid timing-sensitive assertions on the test-timeout path.
 
