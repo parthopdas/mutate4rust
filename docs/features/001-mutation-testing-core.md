@@ -93,7 +93,7 @@ One or more tasks per slice.
 | T8  | S3 | `cargo test` runner with per-mutant timeout; classify killed/survived/uncovered (timeout and non-compiling folded into killed, per Go parity). | Done ✅ | cea810a |
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Done ✅ | 54d30e2 |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Done ✅ | 04b15fd |
-| T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map; **add `llvm-tools-preview` + `cargo-llvm-cov` to both CI legs**; **verify A6 `--reuse-coverage`-without-coverage against upstream**. | Pending | - |
+| T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map; **add `llvm-tools-preview` + `cargo-llvm-cov` to both CI legs**; **verify A6 `--reuse-coverage`-without-coverage against upstream**. | Done | `TBD` |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Pending | - |
 | T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise, **float constants (`0.0↔1.0`)**; precondition-gated emission (A8-adjacent). | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
@@ -581,6 +581,160 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     a test be the only place the decision lives.
   - **T17 — `--mutation-warning` default 50:** keep it and document the divergence, or scale it. A
     conscious call, not a silent parity inherit.
+
+- **T11 — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S5 NOT closed — T12 outstanding.** Both S4-close
+  slice items discharged: R8 landed in CI on **both** legs at T11 (not T12), and A6 was **verified against
+  upstream source**, not guessed. The Core/Infra cut is the cleanest in the feature so far, and the fixture
+  is the right kind of evidence — a real capture preserving `[3,25,5,6,3,…]`, the one region shape that makes
+  the naive start-line mapping wrong.
+  - **1. Layering — correct, and the serde DTOs are on the right side.** `coverage_map` is genuinely pure
+    (no `std::fs`/`std::process`/`serde`; imports nothing), `coverage` is the only module touching process/fs,
+    and Core is clean in **both** directions (`site`/`scanner`/`operators`/`outcome` import no coverage
+    module). `Export`/`ExportData`/`ExportFunction` are private DTOs modelling an **external tool's wire
+    format** — a versioned LLVM document — so they belong in Infrastructure by definition, and
+    `parse_export(&str, &Path) -> Result<CoverageMap>` is a textbook anti-corruption translation: the
+    dependency points **inward** (infra → Core type), never outward. The temptation to promote `parse_export`
+    to Core because it is pure must be resisted — purity is not the test; **knowledge of a foreign format**
+    is. Seams take domain primitives (`&Path`, `&[String]`, `&[OsString]`), never `&Cli`; `RunConfig` still
+    correctly does not exist. The JSON-over-`--lcov` choice is right and correctly reasoned: lcov has already
+    applied *llvm-cov's* collapse rule, which would make C8/R5 unfalsifiable rather than solved.
+  - **2. Region→line rule — faithful, and `is_line_covered`'s shape is right for T12.** `count > 0 &&
+    start_line <= line <= end_line` is byte-for-byte upstream `coverage.Covered`, and the two properties the
+    doc names (regions span lines; any-covered-wins is monotone) are the correct ones. Monotonicity also
+    silently buys the **generic-instantiation** case for free — a generic fn appears once per instantiation
+    with independent counts, and any-wins is the right fold. Empty map ⇒ everything uncovered matches
+    upstream's absent-profile behaviour. The signature `(&self, line: usize) -> bool` is the right shape:
+    line-keyed, `Site`-free (so Core doesn't grow an intra-Core coupling), owned-by-caller, and — the part
+    that matters — **it keeps the representation open**: the linear scan is O(sites × regions), fine at MVP
+    scale, and if profiling ever bites, a sorted interval index drops in behind the identical signature.
+    Do **not** optimize now (YAGNI).
+    - **T12 alignment worth exploiting:** covered-only gating and `--lines` (T15) are *both* line-keyed
+      predicates over the pipeline's site list, applied between `scan_source` and the mutate loop. Land
+      **one** composition point in T12 that T15 extends, not two independent filters.
+  - **3. The `coverage_command`/`run_coverage` seam — justified; it is not the T9 fake-writer.** T9 rejected
+    a **polymorphic trait** introduced solely to let tests substitute a fake for the real fs. This is
+    categorically different: it is a **parameter**, not an abstraction. The real `Command`/`Stdio`/exit-status/
+    stderr code path executes in the tests, against real processes — the same "test the real thing" principle
+    that made the read-only-target technique the right call. It also matches the repo's own established
+    precedent, `TestRunner::new(command, …)` + `runner::default_command()`, so T11 introduces no new idiom.
+    `a_coverage_run_that_fails_reports_the_status_and_the_stderr` is the strongest test in the change: a
+    digit-free script name plus full-equality against a message rebuilt from a *real* probe run means it
+    cannot be satisfied by an incidental substring and cannot drift across platform `ExitStatus` renderings.
+    Endorsed.
+    - **Nit:** `backend_probe() -> Vec<String>` vs `coverage_command() -> Vec<OsString>` — two vocabularies
+      for one concept inside one module. Prefer `OsString` for both (paths force it); a five-line change,
+      fold it into T12 rather than a churn commit.
+    - **Do NOT extract a shared spawn helper yet.** `run_coverage` and `TestRunner::run` both render+spawn,
+      but with genuinely different semantics (capture vs `wait_timeout`+kill) and different error contracts.
+      Two call sites is not DRY pressure. Revisit only if T16/T17 introduces a third spawner.
+  - **4. `pub` visibility — tighten in T12, and T12 is the *first moment it can compile clean*.** The
+    profile's least-privilege rule does argue for `pub(crate)` now, and there is no external consumer (no
+    `tests/` directory exists; `main.rs` reaches only `cli`+`version`), so this is pure accidental surface.
+    But tightening **today** would fail the `-D warnings` gate: `generate`, `reuse`, and
+    `CoverageMap::is_empty` have **zero non-test callers** while `pipeline.rs` is untouched, so `pub(crate)`
+    turns them into `dead_code`. The honest sequencing is therefore **not** "fold into S8" — it is: tighten
+    `coverage`, `coverage_map` and their items to `pub(crate)` **in T12**, at the exact commit that gives
+    them real callers, and leave the *pre-existing* accidental surface (`apply`, `runner`, `scanner`,
+    `site`, `manifest`, `outcome`) to the S8 sweep. Record it as a T12 acceptance item so it is not lost
+    between the two.
+    - **Standing profile gap (pre-existing, not T11's):** the project profile mandates
+      `#![forbid(unsafe_code)]`; `src/lib.rs` carries no such attribute and never has. One line, zero risk —
+      add it in T12 or the S8 sweep, but stop carrying an unmet stated convention.
+  - **5. Format-drift guard is one notch weaker than the tests claim.** `a_short_region_tuple_is_an_error`
+    asserts "a format change must fail loudly", but the length check only catches **truncation**. A field
+    **reorder** in a future export version would be read silently at the wrong indices and could report a
+    covered file as uncovered — the exact silent-wrong-answer R8 exists to prevent. Cheap close in T12: read
+    the export's `type` (`llvm.coverage.json.export`) and `version` major, and fail with a named message on
+    an unexpected value. The fixture already pins 3.1.0 in its doc comment; make the code assert what the
+    comment claims.
+  - **6. Region `kind` (tuple index 7) is ignored — safe direction, but say so deliberately.** The tuple's
+    trailing field distinguishes Code / Expansion / Skipped / Gap / Branch / MC-DC regions, and the parse
+    treats them all alike. Zero-count kinds are harmless (the rule is monotone — they can never *remove*
+    coverage), and a non-zero-count Gap/Expansion region can only *over*-mark a line as covered, i.e. we
+    mutate a site we might have skipped and report the survivor. That is the **correct direction to err**:
+    over-reporting is visible, under-reporting is silent. But it means our numbers may not match
+    `cargo llvm-cov report`'s own line percentages (llvm-cov excludes gap-only lines). Document the
+    acceptance in the module header, or filter to kind 0 — either is fine; leaving it undocumented is not.
+  - **7. Test gaps I would actually ask for (T12).**
+    - **`reuse`'s success path and `load`'s read path have zero coverage** — only the absent-profile error is
+      tested. Writing `FIXTURE_EXPORT` to `profile_path(dir)` and asserting `reuse` returns the same map as
+      `parse_export` is ~8 lines and closes the only untested production path in the module.
+    - **The CI install is currently unearned.** Both legs now install `llvm-tools-preview` +
+      `cargo-llvm-cov` and verify `--version` — but **no test in the suite invokes the backend**, so we pay
+      the install on every run and prove nothing beyond presence. T12 must land the feature file's own
+      guidance — the end-to-end tiny-fixture-crate run (discover → coverage → mutate → test → report) with a
+      known covered/uncovered outcome. That is also the **first real proof of the Windows leg**, which the
+      S4-close item asked for "first, not last". Keep it to one such test (golden rule #8: don't overdo).
+    - Minor: no test exercises a **non-zero `file_id`** (multi-file function / macro expansion); the fixture
+      has single-entry `filenames`, so the indexing logic is only proven on the error path.
+  - **8. Carry-forwards to T12 — confirmed, with two additions.**
+    - **Upstream's stdout notice is owed:** `"Reusing existing coverage; covered/uncovered classification may
+      be stale."` on the `--reuse-coverage` path. Verified present upstream, deliberately not implemented at
+      T11. It is parity, and it is the user's only signal that the gate may be lying to them. Not optional.
+    - **`Site.kind` → method** (from T10): T12 is its first real consumer; convert `pub kind` to
+      `pub fn kind(&self)` there rather than growing a second reader of derivable state.
+    - **`Operator::canonical_token()` + `Operator::ALL`** (from T10): still owed, and T12 raises the payoff —
+      `canonical_token` is exactly the rendering primitive the per-mutant record needs, and `ALL` makes the
+      compiler enforce `every_mapping_changes_the_token` instead of trusting a hand-kept list.
+    - **Per-mutant records with panic-killed distinguishable:** unchanged and now urgent — an uncovered-site
+      **list** (A6) is not expressible by a counter, and T10 sharpened the equivalent-mutant problem into a
+      location-less `Survived`. Land the record shape in T12 with counters becoming derived and `summary()`
+      becoming a rendering; do not bolt a parallel list onto `MutationReport`.
+    - **NEW — the double compile before the first mutant (R1).** A default run will now do a `cargo llvm-cov`
+      pass **and** `pipeline::check_baseline`'s `cargo test`. `cargo-llvm-cov` builds instrumented into its
+      own target directory, so the coverage pass does **not** warm the cache the mutate loop uses: two full
+      compiles before mutant #1. Both are defensible (the baseline must be measured on a *non*-instrumented
+      build — T17 derives the timeout from it — and a green `llvm-cov` run is not a substitute), so this is a
+      cost to **acknowledge and order correctly**, not to eliminate: coverage first, against pristine source,
+      before `RestoreGuard` takes its copy. `--reuse-coverage` is the user's lever. Record it under R1.
+    - **NEW — the file's own `#[cfg(test)] mod tests` is a coverage-gating landmine.** The scanner performs
+      no `cfg`-attribute filtering (`visit_item_mod` recurses unconditionally), and test-module lines are
+      **always covered by construction** — the fixture proves it: regions `[18..20]` carry count 1. So
+      covered-only gating will *preferentially* mutate a file's own test code while skipping genuinely
+      uncovered production code. Upstream never faced this: Go tests live in a separate `_test.go` file that
+      the one-file-at-a-time model simply never selects. **This is a real C-class conflict absent from
+      C1–C10** and it is a product decision, not mine: (a) skip `#[cfg(test)]` items at discovery, (b) mutate
+      them and accept the noise, or (c) warn. My recommendation is (a) — a mutant of an assertion constant is
+      killed by its own test, costs a full compile, and carries no signal about test quality. → human.
+  - **9. Path matching (`normalise`-then-suffix) — the matching rule is fine; the *silent* failure is not.**
+    Suffix matching is the correct port of upstream and the separator normalisation is right. Case is a real
+    hole on Windows: a user typing `SRC/Lib.rs` opens the file fine (case-insensitive fs), scans fine, and
+    then matches **nothing** in the export — yielding an empty map, every site `Uncovered`, zero mutants run,
+    and **exit 0**. A silent wrong answer is precisely what R8/A6 were written to forbid. But blanket
+    case-folding is the wrong fix — it would be incorrect on Linux. Ruling: **not an accepted limitation, and
+    the fix is not case-insensitivity.** T12 must land the backstop, and should prefer the precise fix:
+    - **Mandatory (T12):** when `CoverageMap::is_empty()` after a *successful* coverage generation, do not
+      report "everything uncovered" — that outcome is far more often a path mismatch than a genuinely
+      untested file. Fail (or warn loudly) naming the target and the profile, listing what the export *did*
+      contain. `is_empty()` already exists for exactly this; give it its production caller.
+    - **Preferred (T12):** canonicalise the target with `std::fs::canonicalize` before matching — llvm-cov
+      emits absolute native paths, and on Windows canonicalisation resolves to the on-disk casing, making the
+      comparison platform-correct rather than platform-guessed. Keep the suffix rule as the fallback when
+      canonicalisation fails (note the `\\?\` prefix caveat already recorded at T9). Keep normalise-then-
+      suffix; add exactness where the OS can supply it.
+  - **10. A6 verification — accepted as discharged.** Upstream `ensureCoverage` erroring when
+    `--reuse-coverage` is set and `LoadProfile` returns `nil, nil` on `os.IsNotExist` is a genuine source
+    verification, and `target/coverage/coverage.out` → `target/coverage/coverage.json` is a port of the
+    location, not an invention (A2 intact). The provisional S4-close answer and upstream agree; record that
+    they agreed, which is worth more than either alone.
+  - **Endorsed, don't second-guess:** the `coverage` tests importing `crate::scanner`/`crate::site` is an
+    **inward** dependency and is what makes `every_site_on_a_multi_site_line_resolves_consistently` a real
+    proof rather than an assertion about a hand-built map — it discharges the T10 carry-forward exactly as
+    written, with pinned site counts (4 on line 4, 2 on line 11) so it cannot degrade into a single-site
+    tautology. Fixture reduction is honest and documented (region tuples verbatim; only unconsumed bulk
+    stripped). `pipeline.rs` left untouched is the right call — nothing consumes the map yet, and a
+    speculative wiring would have been the premature move.
+
+### A6 — upstream verification (discharged at T11, recorded verbatim)
+Verified against `unclebob/mutate4go` `internal/runner/runner.go`:
+- `ensureCoverage` **errors** when `--reuse-coverage` is set and the profile is absent — `LoadProfile`
+  returns `nil, nil` on `os.IsNotExist`, and the caller treats that as a hard failure. Our behavior
+  (error + exit `1`) therefore **matches upstream**; the provisional S4-close answer and upstream agree.
+- Upstream's profile location is `target/coverage/coverage.out`. Ours is `target/coverage/coverage.json`
+  — a **port of the location** to our JSON-export backend, not an invention (A2 intact).
+- Upstream additionally prints to stdout: `"Reusing existing coverage; covered/uncovered classification
+  may be stale."` on the reuse path. **Not implemented at T11 — owed to T12** (parity, and the user's
+  only signal that the gate may be stale).
 
 ### ⚠ S5 slice-level items owed to the human (raised at S4 close) — RESOLVED
 1. **R8 / external tool dependency — CONFIRMED.** `cargo-llvm-cov` + `llvm-tools-preview` go into

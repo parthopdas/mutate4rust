@@ -42,6 +42,28 @@ jobs:
           rustc --version
           cargo --version
 
+      # Coverage backend (R8 / A2 / C2). Installed on BOTH matrix legs —
+      # ubuntu-latest and windows-latest — because mutate4rust gates mutation on
+      # `cargo-llvm-cov` coverage and a missing backend is a hard exit-1, never a
+      # silent mutate-everything. `llvm-tools-preview` supplies llvm-profdata /
+      # llvm-cov, which cargo-llvm-cov shells out to.
+      - name: Add llvm-tools-preview
+        if: steps.detect.outputs.cargo == 'true'
+        run: rustup component add llvm-tools-preview
+
+      # taiki-e/install-action fetches a prebuilt cargo-llvm-cov for both Linux
+      # and Windows; it is the install path cargo-llvm-cov's own README
+      # prescribes, and avoids a ~5-minute `cargo install` rebuild per leg.
+      - name: Install cargo-llvm-cov
+        if: steps.detect.outputs.cargo == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Verify coverage backend
+        if: steps.detect.outputs.cargo == 'true'
+        run: cargo llvm-cov --version
+
       - name: Build
         if: steps.detect.outputs.cargo == 'true'
         run: cargo build --all-targets --verbose
