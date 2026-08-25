@@ -920,7 +920,7 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     `--since-last-run`, `--mutate-all` arriving together), and it should be introduced there rather
     than retrofitted out of `&Cli` coupling.
 
-### ⚠ Product decisions owed to the human (raised at T12 close / S5 close)
+### ⚠ Product decisions raised by Anders at T12 close / S5 close (see RESOLVED section below)
 1. **Score-line qualifier.** Does `Score: 100.0%` carry its denominator and the uncovered exclusion
    inline (e.g. `100.0% (1 of 1 mutants run; 1 site uncovered, excluded)`), or stay bare? The bare
    form is correct per design.md but invites a "fully tested" misread on a partially-covered file.
@@ -940,6 +940,29 @@ Verified against `unclebob/mutate4go` `internal/runner/runner.go`:
 - Upstream additionally prints to stdout: `"Reusing existing coverage; covered/uncovered classification
   may be stale."` on the reuse path. **Not implemented at T11 — owed to T12** (parity, and the user's
   only signal that the gate may be stale).
+
+### ⚠ Product decisions owed to the human (raised at T12 close / S5 close) — RESOLVED
+1. **Score-line qualifier → QUALIFY INLINE.** The score carries its denominator and the uncovered
+   exclusion on the same line, e.g. `Score:     100.0% (1 of 1 mutants run; 1 site uncovered,
+   excluded)`. The bare form is correct per `docs/design.md` but invites a "fully tested" misread on a
+   partially-covered file. Lands in **T13** (cheap rendering change; `summary()` is already pure
+   rendering over the records). The summary remains a **change-detector, not a stability contract**
+   pre-1.0 — D4 serializes records and must never re-parse `summary()`.
+2. **Mutant stdout → SUPPRESS BY DEFAULT, SURFACE UNDER `--verbose` (T17).** Confirmed. Today the
+   runner inherits child stdout, so a real run prints one full `cargo test` transcript per mutant and
+   buries the report; the e2e test had to count uncovered *entries* rather than grep a line number
+   because of it. The `--verbose` flag is already reserved for exactly this. Accepted as a UX
+   divergence that changes what a CI log looks like. The baseline's stderr capture stays as-is — it
+   is what makes the red-baseline abort diagnosable.
+3. **`--lines` × coverage precedence → CONFIRMED: FILTERS NARROW, GATING CLASSIFIES.** A covered site
+   outside `--lines` is **not** `Uncovered` — recording it as such would be a false statement about the
+   test suite and would corrupt the one bucket S5 exists to produce. `MutantOutcome` must **not** grow
+   a fourth bucket (A8/parity). A narrowed-out site produces **no record at all**; coverage gating
+   then partitions only what survived narrowing. The summary may carry a non-bucket line
+   (`Sites skipped by --lines: N`). Land the three-way shape at **T15**, when the second filter
+   actually arrives (YAGNI) — but **T13 must not harden the current two-way partition into an
+   assumption**. Upstream's own `--lines`×coverage precedence is still **owed verification at T15**
+   (same discipline as the A6 resolution: check the source, record what it does).
 
 ### ⚠ Product decisions owed to the human (raised at T11 close) — RESOLVED
 1. **Sites inside the target file's own `#[cfg(test)] mod tests` → SKIP AT DISCOVERY, IN T12.**
