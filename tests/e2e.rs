@@ -191,3 +191,36 @@ fn reuse_without_a_profile_exits_one() {
         "the error must name the problem:\n{stderr}",
     );
 }
+
+/// An unparseable target is rejected by the pre-flight parse **before** the
+/// coverage backend is invoked.
+///
+/// The proof is not the exit code — that would also be 1 if the coverage build
+/// ran and then discovery failed. It is that the fixture crate has **no
+/// `target/` directory afterwards**: `cargo llvm-cov` cannot run without
+/// creating one (it writes `target/coverage/coverage.json` and a full
+/// instrumented build tree), so its absence means the backend was never invoked.
+/// Cheap by construction — nothing is ever compiled.
+#[test]
+fn an_unparseable_target_never_reaches_coverage() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    seed_fixture(root);
+    std::fs::write(root.join("src/lib.rs"), "pub fn broken( {\n").expect("write broken lib");
+
+    let (stdout, stderr, code) = run_binary(root, &[]);
+
+    assert_eq!(code, 1, "C11: any error exits 1\n{stdout}\n{stderr}");
+    assert!(
+        !root.join("target").exists(),
+        "the coverage backend must never have been invoked:\n{stdout}\n{stderr}",
+    );
+    assert!(
+        !stdout.contains("Killed:"),
+        "no report may be printed:\n{stdout}",
+    );
+    assert!(
+        stderr.contains("lib.rs"),
+        "the error must name the target:\n{stderr}",
+    );
+}

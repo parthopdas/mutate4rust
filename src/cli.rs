@@ -364,9 +364,16 @@ impl Cli {
     /// Resolves the two caller-owned paths — the target `.rs` file and the crate
     /// root the test command runs in — and drives the pipeline.
     ///
+    /// The target is **pre-flight parsed first**: a syntax error is a certain,
+    /// millisecond-cheap failure, and learning about it only after a full
+    /// instrumented coverage build is pure waste. This is a *validation*, not a
+    /// pipeline stage — it reorders nothing (R1: coverage still resolves against
+    /// pristine source before `RestoreGuard` takes its copy).
+    ///
     /// `--test-command` and `--timeout-factor` are still unwired (T17); the run
     /// uses [`runner::default_command`] and [`pipeline::DEFAULT_MUTANT_TIMEOUT`].
     fn mutate(&self) -> anyhow::Result<MutationReport> {
+        preflight_parse(&self.file)?;
         let crate_root = crate_root_of(&self.file)?;
         pipeline::run(
             &self.file,
@@ -376,6 +383,17 @@ impl Cli {
             self.reuse_coverage,
         )
     }
+}
+
+/// Rejects an unparseable target before any build is paid for.
+///
+/// Reading the file is infrastructure work done here; deciding whether the bytes
+/// are Rust is delegated to the pure [`scanner::validate_source`] seam.
+fn preflight_parse(target: &Path) -> anyhow::Result<()> {
+    let source = std::fs::read_to_string(target)
+        .with_context(|| format!("failed to read source `{}`", target.display()))?;
+    scanner::validate_source(&source)
+        .with_context(|| format!("cannot mutate `{}`", target.display()))
 }
 
 /// The nearest ancestor directory of `target` containing a `Cargo.toml` — the
@@ -806,5 +824,62 @@ mod tests {
 
         assert_eq!(Mode::resolve(&cli), Mode::Mutate);
         assert_eq!(cli.run(), ExitStatus::Error);
+    }
+
+    /// The pre-flight validation rejects an unparseable target and names it, so
+    /// the error is actionable before a single build is paid for.
+    #[test]
+    fn preflight_rejects_an_unparseable_target() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let target = dir.path().join("broken.rs");
+        std::fs::write(&target, "fn broken( {\n").expect("seed source");
+
+        let err = preflight_parse(&target).expect_err("a syntax error must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("broken.rs"),
+            "the error must name the target: {err:#}",
+        );
+    }
+
+    /// Control for the test above: the identical path holding valid Rust passes,
+    /// so it is the *syntax error* that is rejected, not the file or the check.
+    #[test]
+    fn preflight_accepts_a_parseable_target() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let target = dir.path().join("fine.rs");
+        std::fs::write(&target, "fn fine(a: i32) -> i32 { a + 1 }\n").expect("seed source");
+
+        assert!(preflight_parse(&target).is_ok());
+    }
+
+    /// The pre-flight is what rejects an unparseable target, and it fires
+    /// *first*. The fixture deliberately lives inside a valid crate, so
+    /// `crate_root_of` succeeds and the pre-flight is the only check that can
+    /// fail before a subprocess is spawned — which is why asserting on its
+    /// message is meaningful: with the pre-flight removed the run would reach the
+    /// coverage backend and report something else entirely.
+    #[test]
+    fn a_mutation_run_rejects_an_unparseable_target_before_any_subprocess() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("seed manifest");
+        let target = dir.path().join("broken.rs");
+        std::fs::write(&target, "fn broken( {\n").expect("seed source");
+        let cli = Cli::try_parse_from(["mutate4rust", &target.display().to_string()])
+            .expect("parse arguments");
+
+        let err = cli
+            .mutate()
+            .expect_err("an unparseable target must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("cannot mutate"),
+            "the pre-flight must be what failed: {err:#}",
+        );
+        assert_eq!(cli.run(), ExitStatus::Error, "C11: any error exits 1");
     }
 }

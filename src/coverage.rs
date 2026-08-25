@@ -299,20 +299,6 @@ fn read_export(profile: &Path) -> Result<Export> {
         .with_context(|| format!("failed to parse coverage profile `{}`", profile.display()))
 }
 
-/// Parses an `llvm.coverage.json.export` document into line coverage for
-/// `target`, discarding every region belonging to another file.
-///
-/// # Errors
-///
-/// Returns an error if the document is not valid JSON in the expected shape, if
-/// its `type`/`version` are not the format this parser understands, if a region
-/// tuple is shorter than [`REGION_FIELDS`], or if a region names a `file_id` the
-/// function does not declare.
-#[cfg(test)]
-pub(crate) fn parse_export(json: &str, target: &Path) -> Result<CoverageMap> {
-    map_for(&parse_document(json)?, target)
-}
-
 /// Deserializes an export and rejects a document this parser does not understand.
 ///
 /// The `type`/major-`version` assertion is the format-drift guard: the region
@@ -463,14 +449,24 @@ struct ExportFunction {
 mod tests {
     use super::{
         EXPECT_TYPE, Export, MISSING_BACKEND_HINT, REUSE_NOTICE, backend_probe, check_backend,
-        coverage_command, ensure_not_empty, matches_target, parse_export, profile_path, reuse,
-        run_coverage,
+        coverage_command, ensure_not_empty, map_for, matches_target, parse_document, profile_path,
+        reuse, run_coverage,
     };
     use crate::coverage_map::CoverageMap;
     use crate::scanner;
     use crate::site::{Operator, Site};
     use std::ffi::OsString;
     use std::path::Path;
+
+    /// Test scaffolding: the document parse and the region→line mapping in one
+    /// step, which is how every fixture here is written.
+    ///
+    /// Production composes the two itself (`read_export` → `map_for`), so this
+    /// wrapper has no production role and lives here rather than in the module's
+    /// public surface.
+    fn parse_export(json: &str, target: &Path) -> anyhow::Result<CoverageMap> {
+        map_for(&parse_document(json)?, target)
+    }
 
     /// Wraps `data` in the document envelope every real export carries, so an
     /// inline fixture exercises the same `type`/`version` guard production does.

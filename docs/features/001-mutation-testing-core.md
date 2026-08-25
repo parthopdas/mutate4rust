@@ -95,7 +95,9 @@ One or more tasks per slice.
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Done ✅ | 04b15fd |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map; **add `llvm-tools-preview` + `cargo-llvm-cov` to both CI legs**; **verify A6 `--reuse-coverage`-without-coverage against upstream**. | Done | `a89ae64` |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Done | `2cf768c` |
-| T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise, **float constants (`0.0↔1.0`)**; precondition-gated emission (A8-adjacent). | Pending | - |
+| T13a | S6 | Token-level Rust operators that fit the current `Site` model: **float constants (`0.0↔1.0`, suffix preserved)**, bitwise (`&`↔`|`, `^→&`, `<<`↔`>>`), predicate-method swaps (`.is_some()`↔`.is_none()`, `.is_ok()`↔`.is_err()`). Plus T12 housekeeping: score-line qualifier, `#[cfg(test)]` gated once in `visit_item`, `parse_export` into `mod tests`, target pre-flight parse. | Done | `TBD` |
+| T13b | S6 | (1) extract `mutant_source(original, site)` (owed from T12); (2) `KillReason::CompileError` **before** any undecidable-precondition operator ships; (3) scanner↔mapping **totality property test**; (4) **no sites inside `syn::Type`** rule; (5) `Stmt`/`Arm` cfg gate sweep; (6) structural operators that fit the current model (`Some(x)→None`, `Ok(x)→Err(_)`, `expr?→expr.unwrap()`, `.unwrap()`/`.expect(_)→.unwrap_or_default()`, match-arm **guard drop**) + record rendering generalizes `canonical_token` → mutation description; (7) bump `Operator::ALL.len()` deliberately. **No Core model change.** | Pending | - |
+| T13c | S6 | `Vec<Edit>` + `splice_all` (descending start order) driven by **arm-body swap alone** — the only S6 operator that cannot be one edit. `replacement` survives as the single-token fast path. Blast radius: `site.rs`, `apply.rs` (+1 fn), one block in `pipeline.rs`. | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
 | T15 | S7 | `--since-last-run`, `--mutate-all`, `--lines`; post-run manifest update; wire changed-count into `--scan`. | Pending | - |
 | T16 | S8 | `--max-workers` isolated worker dirs (isolated target/source copy, seeded from warmed baseline) + aggregation. | Pending | - |
@@ -929,6 +931,232 @@ and reported separately. Full parity with mutate4go's bucket assignment.
    changes what a CI log looks like.
 3. **`--lines` × coverage precedence (T15).** Confirm Anders' ruling — line-excluded sites are
    **not reported at all** (not `Uncovered`, no fourth bucket) — pending the upstream check.
+
+- **T13a — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S6 NOT closed — T13b/T13c outstanding.** The three
+  token-level operator classes land cleanly on the existing model, the roster grows 22 → 33 with
+  membership still guaranteed by construction, and the two T12 housekeeping items plus the score-line
+  human decision are discharged. The slice's real value is not the eleven operators — it is that
+  splitting T13 exposed a **live production defect** (`0f64`) that would have been invisible under
+  operator noise. Everything below is carry-forward or scope-drawing; nothing is owed inside T13a.
+  - **1. The T13a/T13b split — RIGHT CALL, but T13b's scope is drawn on a premise that does not hold.**
+    Deferring the model change until its justifying pressure arrives is exactly the discipline this repo
+    has applied five times already (`RunConfig` → T15, three-way `Selection` → T15, `pub(crate)` at the
+    commit that gives callers, `Site.kind` → method at its first consumer, records at T12). The `0f64`
+    find is the empirical vindication: a mapping that fails mid-run and **aborts a real mutation run**
+    was sitting under the current model and would have been attributed to `Vec<Edit>` churn.
+    - **But: only ONE of T13b's five operator classes actually requires `Vec<Edit>`.**
+      `Some(x) → None` (one span, fixed replacement `"None"`), `Ok(x) → Err(x)` (one span, the `Ok`
+      identifier), `expr? → expr.unwrap()` (one span, the `?` token), `.unwrap() → .unwrap_or_default()`
+      (one span, the method identifier — *the identical shape T13a just shipped for predicate swaps*),
+      and match-arm **guard drop** (one span, replacement `""`) **all fit today**. Match-arm **body
+      swap** — two disjoint spans, each replaced by the other's text — is the **only** operator in S6
+      that cannot be expressed as one edit.
+    - What the other four need is not a multi-span model but the smaller generalization the T12 review
+      already named: **the replacement stops being a function of the token**, and the record stops
+      rendering `canonical_token()` and starts rendering a *mutation description*. `replacement` is
+      already token-independent for 20 of the 33 operators.
+    - **Ruling: re-draw the boundary.** `T13b` = the structural operators that fit the current model +
+      the record-rendering generalization + the `Stmt`/`Arm` cfg gate — **no Core model change**.
+      `T13c` = **arm-body swap**, the *sole* justification for `Vec<Edit>` + `splice_all` (descending
+      start order), landing with its one justifying operator. Same split the human made at T13, applied
+      one level down; it makes the model change a ~40-line commit with a single behavioural driver
+      instead of a model change hiding behind five operators — precisely the failure mode the T13a/T13b
+      split was created to prevent. Corollary: this makes arm-body swap **droppable** without stranding
+      the rest of S6. Under the current drawing it is not.
+    - **T12 carry-forward not yet discharged, and it is now step 1 of T13b:** extract `mutate_sites`'
+      per-site body into `mutant_source(original, site)`. `pipeline.rs` is untouched by T13a (correctly —
+      T13a is a pure free-rider on the T9 decomposition, exactly as S4 was), so the "one obvious point"
+      for the generalization still does not exist. Land it **before** the first structural operator.
+  - **2. The four-gate `#[cfg(test)]` design — CORRECT SHAPE; both deviations from the brief are upheld.**
+    I was wrong on both counts and the coder's correction is the better construction.
+    - The compile-error property demanded is **unattainable**, and the code proves it rather than merely
+      asserting it: `_ => &[]` sits after an exhaustive variant list under `-D warnings`, and an
+      `unreachable_patterns` warning would have failed the gate. The wildcard compiling clean **is** the
+      verification that these enums are `#[non_exhaustive]`.
+    - Four gates, not one, is forced: `visit_item` cannot see a `#[cfg(test)]` trait method or associated
+      const, and the round-1 `ForeignItem` FAIL (`#[cfg(test)] static X: [u8; 1];` leaking its `1` via
+      `visit_type_array → visit_lit_int`) proves the enumeration is real work, not ceremony. That the
+      FAIL was found by a *test* and not by reasoning is the point.
+    - `_ => &[]` meaning **keep scanning** is the right default — under-scanning production code is the
+      worse failure (false confidence, silently) — but **the stated justification is one notch stronger
+      than the truth**. "Over-scanning is visible" only holds if the wrongly-scanned mutant *survives*; a
+      mutated assertion constant inside test-only code is killed by its own test and appears as an
+      ordinary `Killed`, i.e. invisible **and** score-inflating. Keep the default; **soften the claim to
+      "over-scanning costs a compile and inflates the score; under-scanning silently withholds signal —
+      we prefer the former."**
+    - **Dropping the universal completeness claim and naming what is *not* gated is the single best
+      change in T13a.** A comment that enumerates its own holes is worth more than one promising
+      coverage it cannot deliver. House style for every foreign-shaped boundary.
+    - **Closer to enforcement? Exactly one construction, unavailable to us.** rustc's
+      `non_exhaustive_omitted_patterns` lint fires precisely when a wildcard covers omitted variants of a
+      `#[non_exhaustive]` **foreign** enum — written for this exact problem, still **unstable/nightly-only**
+      and therefore unusable under the profile's stable-toolchain posture. Record it as the named future
+      close (verify status before relying on it); build no bespoke substitute meanwhile.
+    - **The general answer to "a hand-kept list is a silent hole", now hit three times — classify the
+      list by who owns the domain.** This deserves a line in `docs/design.md`:
+      - **We own the domain** (`Operator::ALL`) ⇒ make the omission **inexpressible** — generate the list
+        and its consumers from one declaration (`declare_operators!`). Enforcement by construction.
+      - **A foreign, `#[non_exhaustive]` domain** (`syn::Item` & friends) ⇒ enforcement is impossible by
+        construction *and* by compiler. Instead: (a) choose the wildcard default whose failure mode you
+        can live with, and say which; (b) enumerate explicitly anyway, so the audited set is readable in
+        one place; (c) **make the test the enforcement** — a fixture table pairing each construct with
+        its attribute-free control, which is exactly
+        `cfg_test_suppresses_every_item_kind_that_can_hold_a_site`. That test, not the match, holds the
+        property, and it is the artifact a syn bump must be re-run against.
+      - Residual risk to accept knowingly: `syn = "3.0.4"` is a **caret** requirement, so a new variant
+        arrives on a `cargo update` with no signal. An exact `=3.0.4` pin would convert that into a
+        deliberate bump, at the cost of duplicate-syn hazards and no patch fixes. **Recommendation: keep
+        the caret** and add "re-audit `scanner`'s four `*_attrs` matches" to the review checklist for any
+        syn bump — the module header already names 3.0.4 as the audited version, which is half the job.
+  - **3. The single-source float precondition — right for floats; do NOT generalize the shape.
+    Generalize the *invariant* instead, with a property test.** `plain_decimal_float_value` shared by
+    scanner and mapping is correct and well-placed (pure Core, one definition, consumed by the emission
+    gate and the validator).
+    - The two callers feed it **different inputs** — the scanner passes `lit.base10_digits()` (suffix and
+      `_` already stripped by syn), the mapping passes a **raw source slice**. It tolerates both because
+      it re-strips `_`; that is load-bearing and pinned by the `0.0_f32 → 1.0f32` row. Worth one sentence
+      in the doc comment.
+    - **Generalizing the shape to all 33 operators would be over-engineering** — 20 are total
+      token-for-token swaps with no precondition to share. A shared-precondition function is warranted
+      only where the emission decision and the mapping's validation are the *same non-trivial predicate*:
+      floats (done), integer suffixes (done), and **every precondition-gated operator arriving in T13b**.
+    - **The generalizable answer is the invariant, not the function: "the scanner emits a site ⟺ the
+      mapping succeeds."** Today that is asserted only per-row, by hand, in the composition test — another
+      hand-kept list, and exactly the list `0f64` was missing from. **Land one property test at T13b:**
+      scan a corpus fixture including the awkward spellings and assert `operators::replacement(...)` is
+      `Ok` for **every** emitted site. Eight lines; it would have caught `0f64` generically rather than
+      after it aborted a run, and it scales to five more preconditions instead of five more hand-written
+      rows. Pair it with `every_mapping_changes_the_token` — one guards totality, the other non-identity.
+    - **Related:** a mapping failure in `mutate_sites` propagates `?` and **aborts the entire run,
+      discarding the partial report** — what made `0f64` a run-killer rather than a skipped site. Keep
+      the fail-fast (silently skipping would hide precisely this bug class), but **print the partial
+      report before bailing**: a user 40 mutants into a 30-minute run should not lose all of it to an
+      internal invariant violation. T13b or T17.
+  - **4. Predicate-method swaps without type information — CORRECT for a syntactic tool. No guard.**
+    Acquiring type information means `rustc`-as-a-library, a different product. The failure is bounded: a
+    user-defined `is_some()` on a type with no `is_none()` produces a mutant that fails to compile and
+    folds into **Killed** under A8. A name-based heuristic guard would be strictly worse — wrong in both
+    directions, and a fake type system in Core.
+    - **What it costs: the direction of the error is score *inflation*.** A non-compiling mutant is a
+      `Killed` that says nothing about test quality. Tolerable at T13a's scale. **Not tolerable
+      unmeasured at T13b**, where every remaining operator carries an undecidable precondition —
+      `.unwrap() → .unwrap_or_default()` needs `T: Default`, `Ok(x) → Err(x)` a compatible error type,
+      `expr? → expr.unwrap()` a permitting `Try` type. The taxonomy's "precondition-gated emission" rule
+      **cannot be honoured for any of them** without types, so T13b will systematically manufacture
+      non-compiling mutants and score them Killed.
+    - **Recommendation (land at T13b, ahead of the structural operators): add
+      `KillReason::CompileError`.** The record model exists for exactly this fidelity (T12), the detector
+      is cheap and specific in the same style as the arithmetic-panic markers (`error[E…]` /
+      `error: could not compile`), and the bucket set is provably unchanged. Without it we ship a class
+      of operators whose cost we have no instrument to measure — and A5's owed "record the
+      count-divergence magnitude once S6 lands" becomes unanswerable in the one dimension that matters.
+      **Highest-value item in this review after finding #1.**
+  - **5. The two deliberately-unfixed findings — one routing confirmed, and a single rule resolves both.**
+    - **(a) `Stmt::Local` / `Arm` / field-variant-arg — routing to T13b ACCEPTED, with a corrected
+      framing.** These are **noise, not corruption**: `cargo test` compiles with `cfg(test)`, so the
+      mutation is real, covered by construction, and killed by its own test. The cost is a wasted compile
+      and small score inflation — the same cost the human's "skip at discovery" decision avoided, at
+      materially lower frequency. It produces no wrong bucket and no wrong report, so it need not
+      pre-empt T13b. **But do not route it as "T13b is in `syn::Arm` anyway"** — `Stmt::Local` has nothing
+      to do with the arm operator, and hitching the fix to an unrelated operator is how the other three
+      quarters get forgotten. Route it as **one explicit gate-sweep item inside T13b**: `visit_stmt`,
+      `visit_arm`, each a four-line gate, each a new row in
+      `cfg_test_suppresses_every_item_kind_that_can_hold_a_site` (rename it
+      `…every_position_that_can_hold_a_site`). The table is the enforcement; growing it is the fix.
+    - **(b) Array-length literals inside types — RULING: not a `Constant` site, and the fix is one rule
+      worth more than the bug.** `[u8; 1] → [u8; 0]` mutates a **type**, not behaviour: a compile-time
+      constant whose mutation is a near-certain compile error, i.e. a wasted compile scored `Killed` —
+      pure score inflation with zero signal. The taxonomy's `Constant` row means a `0`/`1` in *evaluated
+      code*; a type has no behaviour for a test to notice.
+      - **The rule: sites live in expressions, never in types. Do not descend into `syn::Type`** — a
+        `visit_type` override that returns without recursing, ~4 lines in the scanner.
+      - What one rule buys, disproportionately: it removes the array-length taxonomy problem entirely;
+        it removes **three of the five leaks reported in (a)** — struct field, fn arg and enum variant are
+        *all* `[u8; 1]`-in-type-position, not attribute leaks at all; it makes the `ForeignItem` gate's
+        reachability argument near-vacuous (it should certainly stay); and it forecloses const-generic
+        argument positions (`Foo<1>`, `Foo<{ 1 + 1 }>`) before they are discovered as a fourth instance of
+        the same bug. Nothing of value is lost: array **repeat expressions** (`[0u8; 1]`, an `ExprRepeat`)
+        are expressions and stay in scope. After that rule the residual (a) leaks are exactly
+        **`Stmt::Local` and `Arm`** — two gates, not five.
+      - **Does it need the human? Inform, don't block.** It is a taxonomy narrowing inside my lane, and it
+        aligns code with the taxonomy as written. But it **reduces the site count** on real files, and A5
+        owes the human a recorded count-divergence measurement once S6 lands — so record it as an Anders
+        decision with the human's veto explicitly available, alongside `KillReason::CompileError` which is
+        what will let that A5 measurement finally be made honestly. Land at T13b.
+  - **6. The census finding — there is a process point, and it is not "count more carefully".** A
+    conclusion right for a measurement that was wrong is an **unearned** conclusion; that it survived
+    audit is luck, and luck is not a control. The specific error: a broad mechanical proxy (*how many syn
+    structs carry `attrs`?*) was used to establish a narrow structural claim (*which enums must the
+    visitor gate?*). The proxy can be off by 30% without perturbing the answer — exactly what happened,
+    and exactly why the miss was undetectable from the conclusion.
+    - **Rule to adopt: when a claim is checkable by construction or by test, do not establish it by
+      census.** The true evidence for "there is no fifth item enum" is (a) the set of `visit_*_item` hooks
+      syn declares, enumerable directly, and (b)
+      `cfg_test_suppresses_every_item_kind_that_can_hold_a_site` with its attribute-free controls, which
+      *demonstrates* the property instead of arguing for it. The round-1 `ForeignItem` FAIL was caught by
+      the test, not the census — the census had already "confirmed" four enums while the fourth was
+      unimplemented. That is the whole case, empirically.
+    - Practical form: quantitative claims in a task write-up either (i) carry the command that produced
+      them so they are reproducible, or (ii) are replaced by the test that makes them unnecessary. Prefer
+      (ii). Bhaskar auditing the numbers is the right instinct and should continue — but the durable fix
+      is to stop making the conclusion depend on them.
+  - **7. Assessment of the T13a code itself (all endorsed, no action).**
+    - **The `0f64` fix is correctly placed.** `is_integer_suffix` lives in `operators` (Core, the module
+      that owns literal knowledge) and the scanner consumes it — the dependency points inward, the same
+      shape as the float precondition. Gating in `constant_operator` rather than patching
+      `mutate_int_literal` is right: the site should never have existed. The `0u8` control proves the
+      *suffix* is the discriminator.
+    - **Predicate span = `node.method.span()`** keeps the mutation a single-token replacement and is what
+      lets the class free-ride the existing model; the nested/chained test pinning that each call's span
+      is *its own* identifier and never the receiver's is the right proof shape.
+    - **Bitwise-assign emitting no sites, pinned by its own named test** with the taxonomy cited —
+      discharges the T10 carry-forward as written ("don't let a test be the only place the decision
+      lives"). The scope-boundary idiom holds again: `deferred_operators_emit_no_sites` and
+      `float_literals_are_not_constant_sites` were **inverted, not deleted**.
+    - **`preflight_parse` / `validate_source`** is the Q4 answer implemented exactly as ruled: infra reads
+      the bytes in `cli.rs`, the pure `scanner::validate_source` decides Rust-ness, one `parse` helper
+      guarantees validation and discovery cannot disagree, and R1 ordering is untouched. The e2e test
+      proving it by the **absence of a `target/` directory** rather than by exit code is the strongest
+      available evidence and costs nothing to run.
+    - **The score line** carries the denominator and the exclusion, omits the clause at zero uncovered,
+      and degrades to `n/a (no mutants were run; N uncovered sites excluded)` — all three edges tested,
+      singular/plural handled. It **deviates slightly from the human's illustrative wording**
+      (`1 killed of 1 mutant run` vs `1 of 1 mutants run`); the shipped form is better — it names what
+      the numerator *is* — but it is the human's line, so **flag for a nod, not a change**.
+    - **`parse_export` into `mod tests`** — discharged exactly as ruled.
+  - **Carry-forwards to T13b–T17**
+    - **T13b (in order):** (1) extract `mutant_source(original, site)` — still owed from T12; (2) add
+      `KillReason::CompileError` before any undecidable-precondition operator ships; (3) the
+      scanner↔mapping **totality property test**; (4) the **no-sites-inside-`syn::Type`** rule; (5) the
+      `Stmt`/`Arm` cfg gate as an explicit sweep item with new rows in the (renamed) position table;
+      (6) the structural operators that fit the current model + the record's `canonical_token` →
+      **mutation description** generalization; (7) bump `Operator::ALL.len()` deliberately.
+    - **T13c (new — carved out of T13b):** `Vec<Edit>` + `splice_all` (descending start order) driven by
+      **arm-body swap alone**. `replacement` survives as the single-token fast path. Blast radius
+      unchanged from the T9 estimate: `site.rs`, `apply.rs` (+1 fn), one block in `pipeline.rs`.
+    - **T13b/T17 — print the partial report before bailing on a mapping error;** do not convert the abort
+      into a silent skip.
+    - **T14/T15 — unchanged and still owed:** `function_id` uniqueness is a correctness bug before
+      differential goes live; `Selection` becomes three-way (**narrow → then gate**, narrowed-out sites
+      produce **no record**, no fourth bucket) — **T13a did not harden the two-way partition**, as
+      required; verify `--lines` × coverage precedence against upstream source; records will want
+      `function_id`; `RunConfig` is introduced at T15, not before.
+    - **T16 — unchanged:** both `RestoreGuard`'s target and `crate_root` must point at the worker's
+      isolated copy; coverage generation runs **once**, never per-worker.
+    - **T17 — unchanged, plus one:** process-group / job-object kill (owed for two reasons); bound the
+      stderr buffer; suppress mutant stdout unless `--verbose`; `check_baseline` returns the measured
+      `Duration` and `timeout = baseline × --timeout-factor` (default 10); wire `--test-command`; and
+      **re-measure `--mutation-warning`'s parity-inherited default 50 only after the full S6 roster
+      lands** — T13a moved the count in both directions at once (+11 operators, −`0f64`-class false
+      sites, and −array-length sites once the type rule lands), so any measurement before T13c is stale.
+    - **`docs/design.md`** should gain the **owned-vs-foreign list rule** from item 2 under Conventions —
+      a three-time pattern and the durable lesson of this slice.
+  - **Nothing in T13a compromises the architecture if carried forward.** Core stays pure; the scanner's
+    new `use crate::operators` is an **inward** Core→Core edge, and `is_integer_suffix` /
+    `plain_decimal_float_value` are correctly homed in the module that owns literal knowledge. The only
+    outward edge remains the sanctioned `pipeline → apply`/`runner`/`coverage`. `preflight_parse` reads
+    the file in the adapter and delegates the decision to a pure seam — the right side of the line.
+    Seams still take domain primitives; `RunConfig` correctly still does not exist. **S6 remains open.**
 
 ### A6 — upstream verification (discharged at T11, recorded verbatim)
 Verified against `unclebob/mutate4go` `internal/runner/runner.go`:

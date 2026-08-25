@@ -11,9 +11,12 @@ use std::ops::Range;
 /// Taxonomy category of a mutation site.
 ///
 /// The discovered classes are the feature file's **universal + arithmetic-parity**
-/// set (S3) plus the **arithmetic idiomatic completions** (S4: `/`, `%`, and the
-/// compound-assignment operators). Each class maps to one or more concrete
-/// [`Operator`]s. Bitwise and shift operators remain out of scope (S6).
+/// set (S3), the **arithmetic idiomatic completions** (S4: `/`, `%`, and the
+/// compound-assignment operators), and the **token-level S6 Rust-specific**
+/// classes (T13a: float constants, bitwise/shift operators, predicate-method
+/// swaps). Each class maps to one or more concrete [`Operator`]s. S6's
+/// *structural* operators (`Some(x) → None`, `match`-arm, `unwrap`/`expect`, `?`)
+/// need a multi-span site model and remain out of scope (T13b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteKind {
     /// Binary arithmetic operator — `+`, `-`, `*` (parity) and `/`, `%` (S4).
@@ -30,6 +33,13 @@ pub enum SiteKind {
     Constant,
     /// Compound-assignment operator — `+=`, `-=`, `*=`, `/=`, `%=`.
     CompoundAssignment,
+    /// Float constant `0.0` or `1.0` (S6).
+    FloatConstant,
+    /// Bitwise or shift operator — `&`, `|`, `^`, `<<`, `>>` (S6).
+    Bitwise,
+    /// Zero-argument predicate method — `is_some`, `is_none`, `is_ok`, `is_err`
+    /// (S6). The site's span is the **method name identifier only**.
+    PredicateMethod,
 }
 
 /// Declares the [`Operator`] enum and its [`Operator::ALL`] roster from a single
@@ -108,6 +118,28 @@ declare_operators! {
     DivAssign,
     /// `%=`
     RemAssign,
+    /// float literal `0.0`
+    FloatZero,
+    /// float literal `1.0`
+    FloatOne,
+    /// `&`
+    BitAnd,
+    /// `|`
+    BitOr,
+    /// `^`
+    BitXor,
+    /// `<<`
+    Shl,
+    /// `>>`
+    Shr,
+    /// `.is_some()`
+    IsSome,
+    /// `.is_none()`
+    IsNone,
+    /// `.is_ok()`
+    IsOk,
+    /// `.is_err()`
+    IsErr,
 }
 
 impl Operator {
@@ -117,7 +149,10 @@ impl Operator {
     /// *which* token was mutated) and the input the guardrail test feeds to
     /// `operators::replacement`. For [`Operator::Zero`]/[`Operator::One`] it is
     /// the plain decimal literal — a real site may carry a radix prefix or an
-    /// integer suffix, which only the site's own source slice can supply.
+    /// integer suffix, which only the site's own source slice can supply; the
+    /// same holds for [`Operator::FloatZero`]/[`Operator::FloatOne`] and an
+    /// `f32`/`f64` suffix. For a predicate method it is the bare method name,
+    /// which is exactly what the site's span covers.
     #[must_use]
     pub fn canonical_token(self) -> &'static str {
         match self {
@@ -143,6 +178,17 @@ impl Operator {
             Operator::MulAssign => "*=",
             Operator::DivAssign => "/=",
             Operator::RemAssign => "%=",
+            Operator::FloatZero => "0.0",
+            Operator::FloatOne => "1.0",
+            Operator::BitAnd => "&",
+            Operator::BitOr => "|",
+            Operator::BitXor => "^",
+            Operator::Shl => "<<",
+            Operator::Shr => ">>",
+            Operator::IsSome => "is_some",
+            Operator::IsNone => "is_none",
+            Operator::IsOk => "is_ok",
+            Operator::IsErr => "is_err",
         }
     }
 
@@ -165,6 +211,15 @@ impl Operator {
             | Operator::MulAssign
             | Operator::DivAssign
             | Operator::RemAssign => SiteKind::CompoundAssignment,
+            Operator::FloatZero | Operator::FloatOne => SiteKind::FloatConstant,
+            Operator::BitAnd
+            | Operator::BitOr
+            | Operator::BitXor
+            | Operator::Shl
+            | Operator::Shr => SiteKind::Bitwise,
+            Operator::IsSome | Operator::IsNone | Operator::IsOk | Operator::IsErr => {
+                SiteKind::PredicateMethod
+            }
         }
     }
 }
@@ -225,9 +280,12 @@ mod tests {
     /// The roster is generated with the enum declaration, so membership and order
     /// are guaranteed by construction — this only pins its **size**, so that
     /// adding or removing an operator is a deliberate, acknowledged change.
+    ///
+    /// 22 → 33 at T13a: the S6 token-level operators (2 float constants,
+    /// 5 bitwise/shift, 4 predicate methods).
     #[test]
     fn all_holds_the_declared_operator_roster() {
-        assert_eq!(Operator::ALL.len(), 22);
+        assert_eq!(Operator::ALL.len(), 33);
     }
 
     /// No two operators render the same token — the record's `file:line token`
@@ -254,8 +312,14 @@ mod tests {
             let source = match operator.kind() {
                 SiteKind::BooleanLiteral => format!("fn f() -> bool {{ {token} }}\n"),
                 SiteKind::Constant => format!("fn f() -> i32 {{ {token} }}\n"),
+                SiteKind::FloatConstant => format!("fn f() -> f64 {{ {token} }}\n"),
                 SiteKind::CompoundAssignment => {
                     format!("fn f(mut a: i32, b: i32) {{ a {token} b; }}\n")
+                }
+                // Discovery is purely syntactic, so one receiver type serves all
+                // four predicates — the fixture never needs to type-check.
+                SiteKind::PredicateMethod => {
+                    format!("fn f(x: Option<i32>) -> bool {{ x.{token}() }}\n")
                 }
                 _ => format!("fn f(a: i32, b: i32) -> i32 {{ (a {token} b) as i32 }}\n"),
             };
@@ -301,5 +365,16 @@ mod tests {
         assert_eq!(Operator::MulAssign.kind(), SiteKind::CompoundAssignment);
         assert_eq!(Operator::DivAssign.kind(), SiteKind::CompoundAssignment);
         assert_eq!(Operator::RemAssign.kind(), SiteKind::CompoundAssignment);
+        assert_eq!(Operator::FloatZero.kind(), SiteKind::FloatConstant);
+        assert_eq!(Operator::FloatOne.kind(), SiteKind::FloatConstant);
+        assert_eq!(Operator::BitAnd.kind(), SiteKind::Bitwise);
+        assert_eq!(Operator::BitOr.kind(), SiteKind::Bitwise);
+        assert_eq!(Operator::BitXor.kind(), SiteKind::Bitwise);
+        assert_eq!(Operator::Shl.kind(), SiteKind::Bitwise);
+        assert_eq!(Operator::Shr.kind(), SiteKind::Bitwise);
+        assert_eq!(Operator::IsSome.kind(), SiteKind::PredicateMethod);
+        assert_eq!(Operator::IsNone.kind(), SiteKind::PredicateMethod);
+        assert_eq!(Operator::IsOk.kind(), SiteKind::PredicateMethod);
+        assert_eq!(Operator::IsErr.kind(), SiteKind::PredicateMethod);
     }
 }

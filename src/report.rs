@@ -9,7 +9,9 @@
 //!
 //! Score = `killed / (killed + survived)`. Uncovered sites are excluded from the
 //! denominator and reported separately, so gaining coverage never silently
-//! deflates the score.
+//! deflates the score — and the rendered `Score:` line carries that denominator
+//! and the exclusion inline, so a partially-covered file cannot be misread as a
+//! fully-tested one.
 //!
 //! # Records are the model; counters are derived
 //!
@@ -136,19 +138,43 @@ impl MutationReport {
         (scored > 0).then(|| killed as f64 / scored as f64)
     }
 
+    /// The rendered `Score:` value: the percentage, the fraction of mutants it
+    /// was computed from, and — when there were any — the uncovered sites
+    /// excluded from that denominator.
+    ///
+    /// A bare `100.0%` on a partially-covered file reads as "this file is well
+    /// tested"; carrying the denominator and the exclusion inline makes that
+    /// misread impossible. Zero uncovered sites say nothing about exclusion, and
+    /// a zero denominator says there was no score to compute rather than
+    /// dividing by zero.
+    fn score_line(&self) -> String {
+        let scored = self.killed() + self.survived();
+        let score = match self.score() {
+            Some(score) => format!(
+                "{:.1}% ({} killed of {scored} {} run",
+                score * 100.0,
+                self.killed(),
+                if scored == 1 { "mutant" } else { "mutants" },
+            ),
+            None => "n/a (no mutants were run".to_owned(),
+        };
+        let excluded = match self.uncovered() {
+            0 => String::new(),
+            1 => "; 1 uncovered site excluded".to_owned(),
+            uncovered => format!("; {uncovered} uncovered sites excluded"),
+        };
+        format!("{score}{excluded})")
+    }
+
     /// A greppable multi-line rendering of the records (trailing newline
     /// included): the bucket tallies with the kill breakdown, then the survivor
     /// and uncovered listings — each omitted when empty.
     pub(crate) fn summary(&self) -> String {
-        let score = self.score().map_or_else(
-            || "n/a (no mutants were run)".to_owned(),
-            |score| format!("{:.1}%", score * 100.0),
-        );
         let mut summary = format!(
             "Killed:    {} ({} {}, {} {}, {} {})\n\
              Survived:  {}\n\
              Uncovered: {}\n\
-             Score:     {score}\n",
+             Score:     {}\n",
             self.killed(),
             self.killed_by(KillReason::TestFailure),
             KillReason::TestFailure.label(),
@@ -158,6 +184,7 @@ impl MutationReport {
             KillReason::Timeout.label(),
             self.survived(),
             self.uncovered(),
+            self.score_line(),
         );
         summary.push_str(&self.listing("Survived mutants:", MutantOutcome::Survived));
         summary.push_str(&self.listing("Uncovered sites:", MutantOutcome::Uncovered));
@@ -370,11 +397,52 @@ mod tests {
             "Killed:    3 (2 test-failure, 0 arithmetic-panic, 1 timeout)\n\
              Survived:  1\n\
              Uncovered: 1\n\
-             Score:     75.0%\n\
+             Score:     75.0% (3 killed of 4 mutants run; 1 uncovered site excluded)\n\
              Survived mutants:\n  \
              src/lib.rs:5 Arithmetic `/`\n\
              Uncovered sites:\n  \
              src/lib.rs:6 Constant `1`\n",
+        );
+    }
+
+    /// The score line carries its denominator and the uncovered exclusion, so a
+    /// partially-covered file cannot be misread as a fully-tested one.
+    #[test]
+    fn the_score_line_qualifies_the_percentage() {
+        let mut report = MutationReport::new(FILE);
+        report.record(record(1, Operator::Add, KILLED));
+        report.record(record(2, Operator::Sub, MutantResult::Uncovered));
+
+        assert!(
+            report.summary().contains(
+                "Score:     100.0% (1 killed of 1 mutant run; 1 uncovered site excluded)\n"
+            ),
+            "{}",
+            report.summary(),
+        );
+    }
+
+    /// Edge case: with nothing excluded the line says nothing about exclusion —
+    /// never "0 sites uncovered, excluded".
+    #[test]
+    fn the_score_line_omits_the_exclusion_when_nothing_was_uncovered() {
+        let summary = report_of(&[KILLED, MutantResult::Survived]).summary();
+
+        assert!(
+            summary.contains("Score:     50.0% (1 killed of 2 mutants run)\n"),
+            "{summary}",
+        );
+        assert!(!summary.contains("uncovered site"), "{summary}");
+    }
+
+    /// Edge case: a zero denominator still reports the exclusion that caused it.
+    #[test]
+    fn the_score_line_reports_the_exclusion_even_with_no_score() {
+        let summary = report_of(&[MutantResult::Uncovered, MutantResult::Uncovered]).summary();
+
+        assert!(
+            summary.contains("Score:     n/a (no mutants were run; 2 uncovered sites excluded)\n"),
+            "{summary}",
         );
     }
 

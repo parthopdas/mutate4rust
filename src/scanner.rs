@@ -23,12 +23,27 @@
 //!
 //! Only the literal form is recognised (`#[cfg(test)]`); composite predicates such
 //! as `#[cfg(any(test, feature = "x"))]` are not treated as test-only.
+//!
+//! The gate is applied at four points — [`Visit::visit_item`],
+//! [`Visit::visit_trait_item`], [`Visit::visit_impl_item`] and
+//! [`Visit::visit_foreign_item`] — each reading its node's attributes through a
+//! single `match` over every variant of that enum. Those four are the item enums
+//! `syn` 3.0.4 declares in `item.rs`, so an item in a file — free, associated,
+//! trait or `extern` block — is reached through one of them, and there is no
+//! per-visitor list of gated node types to keep by hand (T13a; a hand-kept list
+//! is exactly what `declare_operators!` was introduced to abolish).
+//!
+//! This claims coverage of *items*, not of every position `syn` 3.0.4 attaches
+//! attributes to: that crate also carries `attrs` on `Stmt`, `Arm`, `Field`,
+//! `Variant`, `FnArg`, `GenericParam`, `WherePredicate`, `Pat` and `Type`, and a
+//! `#[cfg(test)]` there is **not** gated today.
 
 use anyhow::{Context, Result};
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+use crate::operators;
 use crate::site::{Operator, Site};
 
 /// Parses `source` as a Rust file and returns every in-scope mutation site, in
@@ -39,11 +54,30 @@ use crate::site::{Operator, Site};
 /// Returns an error if `source` is not valid Rust — discovery fails fast with a
 /// clear message rather than silently skipping the file (assumption A1).
 pub fn scan_source(source: &str) -> Result<Vec<Site>> {
-    let file =
-        syn::parse_file(source).context("failed to parse Rust source for mutation scanning")?;
+    let file = parse(source)?;
     let mut collector = SiteCollector::new();
     collector.visit_file(&file);
     Ok(collector.sites)
+}
+
+/// Confirms `source` is valid Rust, discarding the parse tree.
+///
+/// The pre-flight validation the mutate run performs on its target *before*
+/// paying for a coverage build: an unparseable file is a fast, certain error, and
+/// learning that after a ~30 s instrumented build is pure waste. This is a
+/// **validation, not a stage** — it reorders nothing (R1: coverage still resolves
+/// before any mutation).
+///
+/// # Errors
+///
+/// Returns an error if `source` is not valid Rust (assumption A1).
+pub(crate) fn validate_source(source: &str) -> Result<()> {
+    parse(source).map(drop)
+}
+
+/// The one `syn::parse_file` call, so discovery and validation fail identically.
+fn parse(source: &str) -> Result<syn::File> {
+    syn::parse_file(source).context("failed to parse Rust source for mutation scanning")
 }
 
 /// A lexical scope pushed while walking. Functions contribute to a site's
@@ -115,19 +149,41 @@ impl SiteCollector {
 }
 
 impl<'ast> Visit<'ast> for SiteCollector {
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if is_cfg_test(&node.attrs) {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if is_cfg_test(item_attrs(node)) {
             return;
         }
+        visit::visit_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if is_cfg_test(trait_item_attrs(node)) {
+            return;
+        }
+        visit::visit_trait_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if is_cfg_test(impl_item_attrs(node)) {
+            return;
+        }
+        visit::visit_impl_item(self, node);
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        if is_cfg_test(foreign_item_attrs(node)) {
+            return;
+        }
+        visit::visit_foreign_item(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         self.scope.push(Frame::Function(node.sig.ident.to_string()));
         visit::visit_item_fn(self, node);
         self.scope.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
-        }
         self.scope.push(Frame::Function(node.sig.ident.to_string()));
         visit::visit_impl_item_fn(self, node);
         self.scope.pop();
@@ -140,9 +196,6 @@ impl<'ast> Visit<'ast> for SiteCollector {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if is_cfg_test(&node.attrs) {
-            return;
-        }
         self.scope
             .push(Frame::Qualifier(self_ty_name(&node.self_ty)));
         visit::visit_item_impl(self, node);
@@ -156,9 +209,6 @@ impl<'ast> Visit<'ast> for SiteCollector {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if is_cfg_test(&node.attrs) {
-            return;
-        }
         self.scope.push(Frame::Qualifier(node.ident.to_string()));
         visit::visit_item_mod(self, node);
         self.scope.pop();
@@ -169,6 +219,16 @@ impl<'ast> Visit<'ast> for SiteCollector {
             self.push_site(operator, node.op.span());
         }
         visit::visit_expr_binary(self, node);
+    }
+
+    /// A zero-argument predicate call (`x.is_some()`) is a site whose span is the
+    /// **method name identifier only**, so the mutation stays a single-token
+    /// replacement.
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if let Some(operator) = predicate_method_operator(node) {
+            self.push_site(operator, node.method.span());
+        }
+        visit::visit_expr_method_call(self, node);
     }
 
     fn visit_lit_bool(&mut self, node: &'ast syn::LitBool) {
@@ -184,6 +244,83 @@ impl<'ast> Visit<'ast> for SiteCollector {
         if let Some(operator) = constant_operator(node) {
             self.push_site(operator, node.span());
         }
+    }
+
+    fn visit_lit_float(&mut self, node: &'ast syn::LitFloat) {
+        if let Some(operator) = float_constant_operator(node) {
+            self.push_site(operator, node.span());
+        }
+    }
+}
+
+/// The attributes of any `syn::Item`, matched variant by variant.
+///
+/// Written as a full match rather than a catch-all so that the set of item kinds
+/// the `#[cfg(test)]` gate understands is visible in one place. `syn::Item` is
+/// `#[non_exhaustive]`, so a trailing arm is unavoidable — it yields **no
+/// attributes**, i.e. "keep scanning", which is the same conservative direction
+/// [`is_cfg_test`] takes for composite predicates: a variant we do not recognise
+/// may still hold production code, and over-scanning is visible where
+/// under-scanning is silent.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(node) => &node.attrs,
+        syn::Item::Enum(node) => &node.attrs,
+        syn::Item::ExternCrate(node) => &node.attrs,
+        syn::Item::Fn(node) => &node.attrs,
+        syn::Item::ForeignMod(node) => &node.attrs,
+        syn::Item::Impl(node) => &node.attrs,
+        syn::Item::Macro(node) => &node.attrs,
+        syn::Item::Mod(node) => &node.attrs,
+        syn::Item::Static(node) => &node.attrs,
+        syn::Item::Struct(node) => &node.attrs,
+        syn::Item::Trait(node) => &node.attrs,
+        syn::Item::TraitAlias(node) => &node.attrs,
+        syn::Item::Type(node) => &node.attrs,
+        syn::Item::Union(node) => &node.attrs,
+        syn::Item::Use(node) => &node.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+/// The attributes of any `syn::TraitItem` — see [`item_attrs`] for the shape.
+fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(node) => &node.attrs,
+        syn::TraitItem::Fn(node) => &node.attrs,
+        syn::TraitItem::Type(node) => &node.attrs,
+        syn::TraitItem::Macro(node) => &node.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+/// The attributes of any `syn::ImplItem` — see [`item_attrs`] for the shape.
+fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(node) => &node.attrs,
+        syn::ImplItem::Fn(node) => &node.attrs,
+        syn::ImplItem::Type(node) => &node.attrs,
+        syn::ImplItem::Macro(node) => &node.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+/// The attributes of any `syn::ForeignItem` — see [`item_attrs`] for the shape.
+///
+/// An `extern` block's items reach the scanner because a declaration's *type* can
+/// hold an expression: the array length in `static X: [u8; 1];` is a `LitInt` the
+/// visitor walks into.
+fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(node) => &node.attrs,
+        syn::ForeignItem::Static(node) => &node.attrs,
+        syn::ForeignItem::Type(node) => &node.attrs,
+        syn::ForeignItem::Macro(node) => &node.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
     }
 }
 
@@ -201,7 +338,8 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Maps a binary operator onto its in-scope [`Operator`], or `None` for operators
-/// deferred to later slices (bitwise, shifts, and the assign-forms of those).
+/// still out of scope (the assign-forms of the bitwise and shift operators, which
+/// the taxonomy does not list).
 ///
 /// A compound assignment (`a += b`) arrives as an [`syn::ExprBinary`] whose
 /// `op` is the assign variant, and that op's span covers exactly the two-character
@@ -227,6 +365,36 @@ fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
         syn::BinOp::MulAssign(_) => Some(Operator::MulAssign),
         syn::BinOp::DivAssign(_) => Some(Operator::DivAssign),
         syn::BinOp::RemAssign(_) => Some(Operator::RemAssign),
+        syn::BinOp::BitAnd(_) => Some(Operator::BitAnd),
+        syn::BinOp::BitOr(_) => Some(Operator::BitOr),
+        syn::BinOp::BitXor(_) => Some(Operator::BitXor),
+        syn::BinOp::Shl(_) => Some(Operator::Shl),
+        syn::BinOp::Shr(_) => Some(Operator::Shr),
+        _ => None,
+    }
+}
+
+/// Maps a zero-argument predicate call onto its [`Operator`], or `None` when the
+/// call is anything else.
+///
+/// **Preconditions:** the call must have **no arguments** and **no turbofish** —
+/// a same-named method taking arguments or explicit generics is a different
+/// method, and swapping its name would be a knowingly non-compiling mutant.
+///
+/// **No receiver type inference is attempted.** mutate4rust is a *syntactic*
+/// tool: it has no type information, so a user-defined `is_some()` on an
+/// unrelated type is mutated just like `Option::is_some`. That is accepted and
+/// consistent with the rest of the scanner — the mutant either fails to compile
+/// (scored Killed, A8) or is a genuine test of that predicate.
+fn predicate_method_operator(call: &syn::ExprMethodCall) -> Option<Operator> {
+    if !call.args.is_empty() || call.turbofish.is_some() {
+        return None;
+    }
+    match call.method.to_string().as_str() {
+        "is_some" => Some(Operator::IsSome),
+        "is_none" => Some(Operator::IsNone),
+        "is_ok" => Some(Operator::IsOk),
+        "is_err" => Some(Operator::IsErr),
         _ => None,
     }
 }
@@ -234,10 +402,33 @@ fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
 /// Maps an integer literal whose base-10 value is `0` or `1` onto the matching
 /// constant [`Operator`]. `base10_digits` is radix-normalized by `syn`, so this
 /// also matches e.g. `0x1` (value `1`); other values are out of scope.
+///
+/// A literal carrying a **float** suffix (`0f64`) also arrives here as a
+/// [`syn::LitInt`]; it is not an integer constant and is filtered out — see
+/// [`operators::is_integer_suffix`].
 fn constant_operator(lit: &syn::LitInt) -> Option<Operator> {
+    if !operators::is_integer_suffix(lit.suffix()) {
+        return None;
+    }
     match lit.base10_digits() {
         "0" => Some(Operator::Zero),
         "1" => Some(Operator::One),
+        _ => None,
+    }
+}
+
+/// Maps a float literal onto the matching constant [`Operator`], **only** for the
+/// plain decimal spellings the mapping can rewrite without re-spelling the
+/// author's literal.
+///
+/// The precondition lives in [`operators::plain_decimal_float_value`] and is
+/// shared with the mapping, so a literal that would be rejected there is never
+/// emitted as a site (precondition-gated emission). Exponent, point-less and
+/// trailing-dot forms therefore yield no site.
+fn float_constant_operator(lit: &syn::LitFloat) -> Option<Operator> {
+    match operators::plain_decimal_float_value(lit.base10_digits()) {
+        Some(0) => Some(Operator::FloatZero),
+        Some(1) => Some(Operator::FloatOne),
         _ => None,
     }
 }
@@ -372,17 +563,40 @@ mod tests {
     }
 
     #[test]
-    fn deferred_operators_emit_no_sites() {
-        // Operators deferred to S6 — bitwise `& | ^` and shifts `<< >>`, plus
-        // their assign forms — must yield NO site. This locks the S4 scope
-        // boundary. Operands are non-literal params so no in-scope
-        // constant/boolean sites can sneak in.
+    fn bitwise_and_shift_operators_are_sites() {
+        // S6/T13a: `& | ^ << >>` are in scope, each spanning exactly its own
+        // token. Operands are non-literal params so no constant/boolean site can
+        // sneak in and skew the count.
         let source = concat!(
             "fn bit_and(a: i32, b: i32) -> i32 { a & b }\n",
             "fn bit_or(a: i32, b: i32) -> i32 { a | b }\n",
             "fn bit_xor(a: i32, b: i32) -> i32 { a ^ b }\n",
             "fn shl(a: i32, b: i32) -> i32 { a << b }\n",
             "fn shr(a: i32, b: i32) -> i32 { a >> b }\n",
+        );
+        let sites = scan(source);
+
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Bitwise));
+        assert_eq!(
+            sites
+                .iter()
+                .map(|s| (s.operator, span_text(source, s)))
+                .collect::<Vec<_>>(),
+            vec![
+                (Operator::BitAnd, "&"),
+                (Operator::BitOr, "|"),
+                (Operator::BitXor, "^"),
+                (Operator::Shl, "<<"),
+                (Operator::Shr, ">>"),
+            ],
+        );
+    }
+
+    #[test]
+    fn bitwise_assign_forms_emit_no_sites() {
+        // The taxonomy lists `& | ^ << >>` only — the assign forms are NOT in
+        // T13a scope and must still yield nothing.
+        let source = concat!(
             "fn bit_compound(mut a: i32, b: i32) {\n",
             "    a &= b;\n",
             "    a |= b;\n",
@@ -391,22 +605,171 @@ mod tests {
             "    a >>= b;\n",
             "}\n",
         );
-        let sites = scan(source);
 
         assert!(
-            sites.is_empty(),
-            "no deferred operator is in S4 scope, got {sites:?}",
+            scan(source).is_empty(),
+            "bitwise assign forms are out of T13a scope",
         );
     }
 
     #[test]
-    fn float_literals_are_not_constant_sites() {
-        // Floats are in scope for S6/T13, not S4 — the scanner matches
-        // `syn::LitInt` only, so `0.0`/`1.0` must yield no site.
-        let source = concat!("fn zero() -> f64 { 0.0 }\n", "fn one() -> f32 { 1.0f32 }\n",);
+    fn predicate_method_calls_span_the_method_name_only() {
+        // The splice replaces the span verbatim, so the span must be the method
+        // identifier — not the receiver, the dot, or the `()`.
+        let source = concat!(
+            "fn a(x: Option<i32>) -> bool { x.is_some() }\n",
+            "fn b(x: Option<i32>) -> bool { x.is_none() }\n",
+            "fn c(x: Result<i32, ()>) -> bool { x.is_ok() }\n",
+            "fn d(x: Result<i32, ()>) -> bool { x.is_err() }\n",
+        );
         let sites = scan(source);
 
-        assert!(sites.is_empty(), "floats are not S4 sites, got {sites:?}");
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::PredicateMethod));
+        assert_eq!(
+            sites
+                .iter()
+                .map(|s| (s.operator, span_text(source, s)))
+                .collect::<Vec<_>>(),
+            vec![
+                (Operator::IsSome, "is_some"),
+                (Operator::IsNone, "is_none"),
+                (Operator::IsOk, "is_ok"),
+                (Operator::IsErr, "is_err"),
+            ],
+        );
+    }
+
+    /// A predicate call is discovered wherever it sits — as the outer call of a
+    /// chain, or nested inside another call's argument — and the span is always
+    /// that call's own method identifier, never the receiver's.
+    #[test]
+    fn nested_and_chained_predicate_calls_span_their_own_method_name() {
+        let source = concat!(
+            "fn a(x: S) -> bool { x.b().is_some() }\n",
+            "fn b(x: S) -> bool { foo(x.is_ok()).is_some() }\n",
+            "fn c(x: S) -> bool { x.is_some().is_none() }\n",
+        );
+        let sites = scan(source);
+
+        assert_eq!(
+            sites
+                .iter()
+                .map(|s| (s.operator, span_text(source, s), s.line))
+                .collect::<Vec<_>>(),
+            vec![
+                // The receiver `x.b()` is not a predicate call, so the only site
+                // on line 1 is the outer `is_some`.
+                (Operator::IsSome, "is_some", 1),
+                // The visitor records a call before descending into it, so the
+                // outer call comes first and the nested argument second — two
+                // distinct spans, neither of them the receiver's.
+                (Operator::IsSome, "is_some", 2),
+                (Operator::IsOk, "is_ok", 2),
+                // A predicate call *as* a receiver is itself a site, and each
+                // call's span is its own name.
+                (Operator::IsNone, "is_none", 3),
+                (Operator::IsSome, "is_some", 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_predicate_method_with_arguments_or_a_turbofish_is_not_a_site() {
+        // Preconditions: zero arguments and no turbofish. A same-named method
+        // that takes either is a different method, and renaming it would be a
+        // knowingly non-compiling mutant — so no site is emitted.
+        //
+        // The control below is the identical call *without* the argument /
+        // turbofish, proving the precondition is what suppresses the site.
+        assert!(
+            scan("fn f(x: S) -> bool { x.is_some(2) }\n").is_empty(),
+            "an argument disqualifies the call",
+        );
+        assert!(
+            scan("fn f(x: S) -> bool { x.is_ok::<i32>() }\n").is_empty(),
+            "a turbofish disqualifies the call",
+        );
+        assert_eq!(
+            scan("fn f(x: S) -> bool { x.is_some() }\n")
+                .iter()
+                .map(|s| s.operator)
+                .collect::<Vec<_>>(),
+            vec![Operator::IsSome],
+            "control: the same call without either is a site",
+        );
+    }
+
+    #[test]
+    fn an_unrelated_zero_argument_method_is_not_a_site() {
+        assert!(
+            scan("fn f(x: S) -> bool { x.is_empty() }\n").is_empty(),
+            "only the four taxonomy predicates are sites",
+        );
+    }
+
+    #[test]
+    fn a_float_suffixed_integer_literal_is_not_a_constant_site() {
+        // `0f64` parses as a *suffixed `LitInt`*, but it is a float literal: the
+        // integer mapping cannot rewrite it, and the point-less float spelling
+        // is deliberately out of scope. Emitting it would have produced a mutant
+        // whose mapping fails mid-run. The control proves the float **suffix** is
+        // what disqualifies it, not the value or the literal kind.
+        assert!(scan("fn f() -> f64 { 0f64 }\n").is_empty());
+        assert!(scan("fn f() -> f32 { 1f32 }\n").is_empty());
+        assert_eq!(
+            scan("fn f() -> u8 { 0u8 }\n")
+                .iter()
+                .map(|s| s.operator)
+                .collect::<Vec<_>>(),
+            vec![Operator::Zero],
+            "control: an integer-suffixed literal is still a site",
+        );
+    }
+
+    #[test]
+    fn plain_decimal_float_constants_are_sites() {
+        // S6/T13a: `0.0`/`1.0` are discovered, span covering the WHOLE literal
+        // (suffix included) so the mapping can preserve it.
+        let source = concat!(
+            "fn zero() -> f64 { 0.0 }\n",
+            "fn one() -> f32 { 1.0f32 }\n",
+            "fn also_zero() -> f32 { 0.0_f32 }\n",
+        );
+        let sites = scan(source);
+
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::FloatConstant));
+        assert_eq!(
+            sites
+                .iter()
+                .map(|s| (s.operator, span_text(source, s)))
+                .collect::<Vec<_>>(),
+            vec![
+                (Operator::FloatZero, "0.0"),
+                (Operator::FloatOne, "1.0f32"),
+                (Operator::FloatZero, "0.0_f32"),
+            ],
+        );
+    }
+
+    #[test]
+    fn float_spellings_outside_the_precondition_emit_no_sites() {
+        // Precondition-gated emission: rewriting these would mean re-spelling a
+        // literal the author did not write, so no site is emitted at all. Each
+        // is paired with its in-scope control in the test above.
+        let source = concat!(
+            "fn a() -> f64 { 1e0 }\n",
+            "fn b() -> f64 { 0.0e0 }\n",
+            "fn c() -> f64 { 0f64 }\n",
+            "fn d() -> f64 { 1.5 }\n",
+            "fn e() -> f64 { 2.0 }\n",
+            "fn f() -> f64 { 10.0 }\n",
+        );
+
+        assert!(
+            scan(source).is_empty(),
+            "only plain decimal 0/1 floats are sites, got {:?}",
+            scan(source),
+        );
     }
 
     #[test]
@@ -442,6 +805,68 @@ mod tests {
                 "fn f(mut a: i32, b: i32) { a %= b; }\n",
                 "fn f(mut a: i32, b: i32) { a *= b; }\n",
             ),
+        ] {
+            let sites = scan(source);
+            assert_eq!(sites.len(), 1, "one site expected in `{source}`");
+            let site = &sites[0];
+            let replacement = crate::operators::replacement(site.operator, span_text(source, site))
+                .expect("mapping should succeed");
+            let mutated = format!(
+                "{}{replacement}{}",
+                &source[..site.byte_span.start],
+                &source[site.byte_span.end..],
+            );
+            assert_eq!(mutated, expected);
+        }
+    }
+
+    #[test]
+    fn s6_spans_and_mappings_compose_into_the_expected_mutant_source() {
+        // Composition proof for every new T13a row: the span the scanner
+        // reports, replaced by the operator's mapping, yields exactly these
+        // bytes — the mutant a real run would write to disk.
+        for (source, expected) in [
+            (
+                "fn f(a: i32, b: i32) -> i32 { a & b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a | b }\n",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> i32 { a | b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a & b }\n",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> i32 { a ^ b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a & b }\n",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> i32 { a << b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a >> b }\n",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> i32 { a >> b }\n",
+                "fn f(a: i32, b: i32) -> i32 { a << b }\n",
+            ),
+            (
+                "fn f(x: Option<i32>) -> bool { x.is_some() }\n",
+                "fn f(x: Option<i32>) -> bool { x.is_none() }\n",
+            ),
+            (
+                "fn f(x: Option<i32>) -> bool { x.is_none() }\n",
+                "fn f(x: Option<i32>) -> bool { x.is_some() }\n",
+            ),
+            (
+                "fn f(x: Result<i32, ()>) -> bool { x.is_ok() }\n",
+                "fn f(x: Result<i32, ()>) -> bool { x.is_err() }\n",
+            ),
+            (
+                "fn f(x: Result<i32, ()>) -> bool { x.is_err() }\n",
+                "fn f(x: Result<i32, ()>) -> bool { x.is_ok() }\n",
+            ),
+            ("fn f() -> f64 { 0.0 }\n", "fn f() -> f64 { 1.0 }\n"),
+            ("fn f() -> f64 { 1.0 }\n", "fn f() -> f64 { 0.0 }\n"),
+            // The suffix survives: dropping `f32` would change the mutant's type.
+            ("fn f() -> f32 { 1.0f32 }\n", "fn f() -> f32 { 0.0f32 }\n"),
+            ("fn f() -> f32 { 0.0_f32 }\n", "fn f() -> f32 { 1.0f32 }\n"),
         ] {
             let sites = scan(source);
             assert_eq!(sites.len(), 1, "one site expected in `{source}`");
@@ -633,6 +1058,121 @@ mod tests {
         );
     }
 
+    /// The holes the single `visit_item` / `visit_trait_item` / `visit_impl_item`
+    /// / `visit_foreign_item` gate closes at T13a: before it, `#[cfg(test)]` was
+    /// checked only on free functions, impl methods, impl blocks and modules, so a
+    /// test-only **trait**, **trait method**, **`extern` declaration**, or
+    /// module-level **`const`/`static`** still contributed sites.
+    ///
+    /// Each case pairs the attributed body with the **identical body lacking the
+    /// attribute**, so a passing assertion can only mean the *attribute*
+    /// suppressed discovery — not that the scanner never looked there.
+    #[test]
+    fn cfg_test_suppresses_every_item_kind_that_can_hold_a_site() {
+        for (attributed, control, what) in [
+            (
+                concat!(
+                    "#[cfg(test)]\n",
+                    "trait T {\n",
+                    "    fn f(a: i32, b: i32) -> i32 { a + b }\n",
+                    "}\n",
+                ),
+                concat!(
+                    "trait T {\n",
+                    "    fn f(a: i32, b: i32) -> i32 { a + b }\n",
+                    "}\n",
+                ),
+                "a test-only trait",
+            ),
+            (
+                concat!(
+                    "trait T {\n",
+                    "    #[cfg(test)]\n",
+                    "    fn f(a: i32, b: i32) -> i32 { a + b }\n",
+                    "}\n",
+                ),
+                concat!(
+                    "trait T {\n",
+                    "    fn f(a: i32, b: i32) -> i32 { a + b }\n",
+                    "}\n",
+                ),
+                "a test-only trait method",
+            ),
+            (
+                "#[cfg(test)]\nconst K: i32 = 1;\n",
+                "const K: i32 = 1;\n",
+                "a test-only module-level const",
+            ),
+            (
+                "#[cfg(test)]\nstatic S: i32 = 0;\n",
+                "static S: i32 = 0;\n",
+                "a test-only module-level static",
+            ),
+            (
+                concat!(
+                    "struct S;\n",
+                    "impl S {\n",
+                    "    #[cfg(test)]\n",
+                    "    const C: i32 = 1;\n",
+                    "}\n",
+                ),
+                concat!(
+                    "struct S;\n",
+                    "impl S {\n",
+                    "    const C: i32 = 1;\n",
+                    "}\n"
+                ),
+                "a test-only associated const",
+            ),
+            (
+                concat!(
+                    "fn outer() -> i32 {\n",
+                    "    #[cfg(test)]\n",
+                    "    const K: i32 = 1;\n",
+                    "    2\n",
+                    "}\n",
+                ),
+                concat!(
+                    "fn outer() -> i32 {\n",
+                    "    const K: i32 = 1;\n",
+                    "    2\n",
+                    "}\n",
+                ),
+                "a test-only const inside a function body",
+            ),
+            (
+                concat!(
+                    "unsafe extern \"C\" {\n",
+                    "    #[cfg(test)]\n",
+                    "    static X: [u8; 1];\n",
+                    "}\n",
+                ),
+                concat!("unsafe extern \"C\" {\n", "    static X: [u8; 1];\n", "}\n",),
+                "a test-only foreign static",
+            ),
+            (
+                concat!(
+                    "unsafe extern \"C\" {\n",
+                    "    #[cfg(test)]\n",
+                    "    fn g() -> [u8; 1];\n",
+                    "}\n",
+                ),
+                concat!("unsafe extern \"C\" {\n", "    fn g() -> [u8; 1];\n", "}\n",),
+                "a test-only foreign function",
+            ),
+        ] {
+            assert!(
+                !scan(control).is_empty(),
+                "control: {what} must be scanned without the attribute",
+            );
+            assert!(
+                scan(attributed).is_empty(),
+                "{what} must contribute no site, got {:?}",
+                scan(attributed),
+            );
+        }
+    }
+
     #[test]
     fn line_numbers_are_one_based() {
         let source = "fn f(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
@@ -720,5 +1260,19 @@ mod tests {
     #[test]
     fn unparseable_source_is_an_error() {
         assert!(scan_source("fn broken(").is_err());
+    }
+
+    /// Validation and discovery agree on what "valid Rust" means — the pre-flight
+    /// check cannot accept a file the scan would then reject.
+    #[test]
+    fn validation_accepts_exactly_what_discovery_parses() {
+        use super::validate_source;
+
+        assert!(validate_source("fn f(a: i32) -> i32 { a + 1 }\n").is_ok());
+        assert!(validate_source("fn broken(").is_err());
+        assert!(validate_source("this is not rust").is_err());
+        // Empty input is a valid (empty) Rust file, exactly as `scan_source` sees it.
+        assert!(validate_source("").is_ok());
+        assert!(scan_source("").is_ok());
     }
 }
