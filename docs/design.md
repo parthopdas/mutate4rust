@@ -89,3 +89,24 @@ same boundary, which enforces their mutual exclusivity. *Latent gap (to close in
   mutate4rust extension** — upstream emits raw counts, no numeric score — so "parity" here means bucket
   parity, not full output parity.
 - **Least-privilege visibility:** prefer the narrowest access modifier that works.
+- **Sites live in expressions, never in types.** The scanner does not descend into `syn::Type`. A
+  literal in type position (an array length, a const-generic argument) is a compile-time constant whose
+  mutation is a near-certain compile error — a wasted build scored `Killed`, i.e. score inflation with
+  zero signal. Array **repeat expressions** (`[0u8; 1]`) are expressions and stay in scope.
+- **Hand-kept lists — classify by who owns the domain.** A list that must stay in sync with something
+  else is a silent hole; the remedy depends on ownership.
+  - **We own the domain** (e.g. `Operator::ALL`) ⇒ make the omission **inexpressible**. Generate the
+    list and its consumers from a single declaration (`declare_operators!`). Enforcement by
+    construction; a second definition is a compile error.
+  - **A foreign `#[non_exhaustive]` domain** (e.g. `syn::Item`, `ForeignItem`, `TraitItem`, `ImplItem`)
+    ⇒ enforcement is impossible by construction *and* by compiler, so: (a) choose the wildcard default
+    whose failure mode you can live with, and **say which** in the code; (b) enumerate the known
+    variants explicitly anyway, so the audited set is readable in one place; (c) **make the test the
+    enforcement** — a fixture table pairing each construct with an attribute-free control. The test,
+    not the match, holds the property, and it is the artifact a dependency bump must be re-run against.
+  - Corollary: a comment that **enumerates its own holes** is worth more than one promising coverage it
+    cannot deliver. Never claim universal completeness over a foreign domain.
+- **Do not establish by census what is checkable by construction or by test.** A conclusion that is
+  right for a measurement that was wrong is unearned. Quantitative claims in a write-up either carry
+  the command that produced them, or — preferably — are replaced by the test that makes them
+  unnecessary.

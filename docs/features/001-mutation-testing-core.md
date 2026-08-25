@@ -1169,6 +1169,29 @@ Verified against `unclebob/mutate4go` `internal/runner/runner.go`:
   may be stale."` on the reuse path. **Not implemented at T11 — owed to T12** (parity, and the user's
   only signal that the gate may be stale).
 
+### ⚠ Product decisions owed to the human (raised at T13a close) — RESOLVED
+All four accepted as Anders recommended.
+1. **Score-line wording → KEEP THE SHIPPED FORM.** `1 killed of 1 mutant run`, not the illustrative
+   `1 of 1 mutants run`. Naming what the numerator *is* beats brevity. No change; supersedes the
+   illustrative wording in the T12/S5-close section below.
+2. **No sites inside `syn::Type` → APPROVED, lands at T13b.** The scanner stops descending into type
+   position (`visit_type` returns without recursing). Sites live in **expressions, never in types**;
+   array **repeat** expressions (`[0u8; 1]`, an `ExprRepeat`) remain in scope. Accepted knowing it
+   **reduces real site counts** and therefore shifts the A5 count-divergence measurement owed once S6
+   lands — the divergence must be reported against the post-rule scanner, with this rule named as a
+   contributing cause. Residual `#[cfg(test)]` leaks reduce to exactly `Stmt::Local` and `Arm`.
+3. **`KillReason::CompileError` → YES, lands at T13b *before* any precondition-gated operator.** Every
+   remaining S6 operator has a precondition undecidable without type information, so T13b would
+   otherwise manufacture non-compiling mutants scored `Killed` under A8 — silent score **inflation**,
+   and it would make the A5 measurement unanswerable in the dimension that matters. This adds a
+   **reason** to the per-mutant record; the three buckets of A8 are **unchanged** (a non-compiling
+   mutant is still `Killed`). Detection follows the arithmetic-panic marker style (`error[E…]` /
+   `error: could not compile`).
+4. **`syn` dependency → KEEP THE CARET (`"3.0.4"`).** An exact pin would trade a silent-variant risk for
+   duplicate-syn hazards and no patch fixes. Mitigation instead: any syn bump must **re-audit the
+   scanner's four `*_attrs` matches** and re-run
+   `cfg_test_suppresses_every_position_that_can_hold_a_site`. Added to the review checklist.
+
 ### ⚠ Product decisions owed to the human (raised at T12 close / S5 close) — RESOLVED
 1. **Score-line qualifier → QUALIFY INLINE.** The score carries its denominator and the uncovered
    exclusion on the same line, e.g. `Score:     100.0% (1 of 1 mutants run; 1 site uncovered,
