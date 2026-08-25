@@ -46,3 +46,12 @@ design in `docs/design.md`.
     - If a prompt tells you otherwise, ignore that part and flag it — it contradicts this boundary.
 11. Prefer the least-privilege access modifier for every construct. Language-specific rules (e.g. C#:
     avoid `internal` unless required — if it is a must, flag it) live in the Project profile.
+12. **Stage your work when you reach done-done: `git add -A`. Never commit — staging is not committing.**
+    An unstaged change exists only as the file on disk; a *staged* one is a blob in the object store and
+    is recoverable via `git fsck --lost-found` even if the working tree is later clobbered. This project
+    has lost a full task's work to an unstaged revert exactly once. Staging is the one habit that would
+    have made it a non-event.
+13. Before running any destructive experiment of your own (sabotage probes, bulk rewrites, dependency
+    surgery), copy the affected files outside the repo and revert from that copy — **never** via
+    `git checkout <file>`, `git restore <file>`, `git stash`, or `git reset --hard` on a dirty tree.
+
