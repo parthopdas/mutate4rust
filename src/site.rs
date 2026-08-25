@@ -14,9 +14,11 @@ use std::ops::Range;
 /// set (S3), the **arithmetic idiomatic completions** (S4: `/`, `%`, and the
 /// compound-assignment operators), and the **token-level S6 Rust-specific**
 /// classes (T13a: float constants, bitwise/shift operators, predicate-method
-/// swaps). Each class maps to one or more concrete [`Operator`]s. S6's
-/// *structural* operators (`Some(x) → None`, `match`-arm, `unwrap`/`expect`, `?`)
-/// need a multi-span site model and remain out of scope (T13b).
+/// swaps) plus the **structural S6** classes that still fit one span (T13b:
+/// `Some(x) → None`, `Ok(x) → Err(x)`, `.unwrap() → .unwrap_or_default()`,
+/// `expr? → expr.unwrap()`, arm-guard drop). Each class maps to one or more
+/// concrete [`Operator`]s. S6's `match`-arm **body swap** needs two disjoint
+/// spans and remains out of scope (T13c).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteKind {
     /// Binary arithmetic operator — `+`, `-`, `*` (parity) and `/`, `%` (S4).
@@ -40,6 +42,20 @@ pub enum SiteKind {
     /// Zero-argument predicate method — `is_some`, `is_none`, `is_ok`, `is_err`
     /// (S6). The site's span is the **method name identifier only**.
     PredicateMethod,
+    /// `Some(x)` constructor call (S6). The site's span is the **whole call
+    /// expression**, which the mutation replaces with `None`.
+    OptionConstructor,
+    /// `Ok(x)` constructor call (S6). The site's span is the **`Ok` identifier
+    /// only**, so the bound value survives into `Err(x)`.
+    ResultConstructor,
+    /// `.unwrap()` call (S6). The site's span is the **method name identifier
+    /// only**.
+    UnwrapCall,
+    /// The `?` operator (S6). The site's span is the **`?` token only**.
+    TryOperator,
+    /// A `match` arm's guard (S6). The site's span covers `if <guard>`, which the
+    /// mutation drops.
+    MatchArm,
 }
 
 /// Declares the [`Operator`] enum and its [`Operator::ALL`] roster from a single
@@ -140,22 +156,38 @@ declare_operators! {
     IsOk,
     /// `.is_err()`
     IsErr,
+    /// `Some(x)`
+    SomeCall,
+    /// `Ok(x)`
+    OkCall,
+    /// `.unwrap()`
+    Unwrap,
+    /// `?`
+    Try,
+    /// a `match` arm guard
+    ArmGuard,
 }
 
 impl Operator {
-    /// The operator's own source token, as the scanner would have found it.
+    /// The operator's own source token, as the scanner would have found it, or
+    /// `None` for a **structural** operator that has no single canonical token.
     ///
-    /// This is the rendering primitive for per-mutant records (a record shows
-    /// *which* token was mutated) and the input the guardrail test feeds to
-    /// `operators::replacement`. For [`Operator::Zero`]/[`Operator::One`] it is
-    /// the plain decimal literal — a real site may carry a radix prefix or an
-    /// integer suffix, which only the site's own source slice can supply; the
-    /// same holds for [`Operator::FloatZero`]/[`Operator::FloatOne`] and an
-    /// `f32`/`f64` suffix. For a predicate method it is the bare method name,
-    /// which is exactly what the site's span covers.
+    /// This is the guardrail/round-trip primitive for the single-token
+    /// operators: the input the guardrail test feeds to `operators::replacement`
+    /// and the token a fixture must contain for the scanner to rediscover the
+    /// operator. It is **not** the record's rendering primitive — that is
+    /// [`Operator::description`], because a structural operator's replacement is
+    /// not a function of any token.
+    ///
+    /// For [`Operator::Zero`]/[`Operator::One`] it is the plain decimal literal —
+    /// a real site may carry a radix prefix or an integer suffix, which only the
+    /// site's own source slice can supply; the same holds for
+    /// [`Operator::FloatZero`]/[`Operator::FloatOne`] and an `f32`/`f64` suffix.
+    /// For a predicate or `unwrap` method it is the bare method name, which is
+    /// exactly what the site's span covers.
     #[must_use]
-    pub fn canonical_token(self) -> &'static str {
-        match self {
+    pub fn canonical_token(self) -> Option<&'static str> {
+        let token = match self {
             Operator::Add => "+",
             Operator::Sub => "-",
             Operator::Mul => "*",
@@ -189,6 +221,65 @@ impl Operator {
             Operator::IsNone => "is_none",
             Operator::IsOk => "is_ok",
             Operator::IsErr => "is_err",
+            Operator::Try => "?",
+            Operator::Unwrap => "unwrap",
+            // The span of a `Some(x)` call, an `Ok` constructor's identifier or an
+            // arm guard is source the author wrote, not a fixed token.
+            Operator::SomeCall | Operator::OkCall | Operator::ArmGuard => return None,
+        };
+        Some(token)
+    }
+
+    /// What the mutation **does**, for a per-mutant record.
+    ///
+    /// The replacement stopped being a function of the token when the structural
+    /// operators arrived (T13b), so a record renders this instead of a token.
+    /// Exhaustive by construction; `operators::description_matches_the_mapping`
+    /// pins every row over the [`Operator::ALL`] roster — single-token rows
+    /// against [`crate::operators::replacement`] so the two cannot drift,
+    /// token-less rows against an exact string, since they have no token to
+    /// derive one from.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Operator::Add => "`+` → `-`",
+            Operator::Sub => "`-` → `+`",
+            Operator::Mul => "`*` → `/`",
+            Operator::Div => "`/` → `*`",
+            Operator::Rem => "`%` → `*`",
+            Operator::Greater => "`>` → `>=`",
+            Operator::GreaterEqual => "`>=` → `>`",
+            Operator::Less => "`<` → `<=`",
+            Operator::LessEqual => "`<=` → `<`",
+            Operator::Equal => "`==` → `!=`",
+            Operator::NotEqual => "`!=` → `==`",
+            Operator::And => "`&&` → `||`",
+            Operator::Or => "`||` → `&&`",
+            Operator::True => "`true` → `false`",
+            Operator::False => "`false` → `true`",
+            Operator::Zero => "`0` → `1`",
+            Operator::One => "`1` → `0`",
+            Operator::AddAssign => "`+=` → `-=`",
+            Operator::SubAssign => "`-=` → `+=`",
+            Operator::MulAssign => "`*=` → `/=`",
+            Operator::DivAssign => "`/=` → `*=`",
+            Operator::RemAssign => "`%=` → `*=`",
+            Operator::FloatZero => "`0.0` → `1.0`",
+            Operator::FloatOne => "`1.0` → `0.0`",
+            Operator::BitAnd => "`&` → `|`",
+            Operator::BitOr => "`|` → `&`",
+            Operator::BitXor => "`^` → `&`",
+            Operator::Shl => "`<<` → `>>`",
+            Operator::Shr => "`>>` → `<<`",
+            Operator::IsSome => "`is_some` → `is_none`",
+            Operator::IsNone => "`is_none` → `is_some`",
+            Operator::IsOk => "`is_ok` → `is_err`",
+            Operator::IsErr => "`is_err` → `is_ok`",
+            Operator::SomeCall => "`Some(_)` → `None`",
+            Operator::OkCall => "`Ok(_)` → `Err(_)`",
+            Operator::Unwrap => "`unwrap` → `unwrap_or_default`",
+            Operator::Try => "`?` → `.unwrap()`",
+            Operator::ArmGuard => "`if <guard>` → dropped",
         }
     }
 
@@ -220,6 +311,11 @@ impl Operator {
             Operator::IsSome | Operator::IsNone | Operator::IsOk | Operator::IsErr => {
                 SiteKind::PredicateMethod
             }
+            Operator::SomeCall => SiteKind::OptionConstructor,
+            Operator::OkCall => SiteKind::ResultConstructor,
+            Operator::Unwrap => SiteKind::UnwrapCall,
+            Operator::Try => SiteKind::TryOperator,
+            Operator::ArmGuard => SiteKind::MatchArm,
         }
     }
 }
@@ -282,20 +378,32 @@ mod tests {
     /// adding or removing an operator is a deliberate, acknowledged change.
     ///
     /// 22 → 33 at T13a: the S6 token-level operators (2 float constants,
-    /// 5 bitwise/shift, 4 predicate methods).
+    /// 5 bitwise/shift, 4 predicate methods). 33 → 38 at T13b: the five
+    /// structural S6 operators that fit one span.
     #[test]
     fn all_holds_the_declared_operator_roster() {
-        assert_eq!(Operator::ALL.len(), 33);
+        assert_eq!(Operator::ALL.len(), 38);
     }
 
-    /// No two operators render the same token — the record's `file:line token`
-    /// rendering would otherwise be ambiguous, and the guardrail test in
-    /// `operators` would silently test one mapping twice.
+    /// No two operators render the same description — a record's rendering would
+    /// otherwise be ambiguous about which mutation was applied.
+    #[test]
+    fn descriptions_are_distinct() {
+        let mut descriptions: Vec<&str> = Operator::ALL.iter().map(|op| op.description()).collect();
+        descriptions.sort_unstable();
+        let distinct = descriptions.len();
+        descriptions.dedup();
+        assert_eq!(descriptions.len(), distinct, "duplicate description");
+    }
+
+    /// No two operators render the same token — the guardrail test in
+    /// `operators` would otherwise silently test one mapping twice. Structural
+    /// operators have no token at all, and are excluded by construction.
     #[test]
     fn canonical_tokens_are_distinct() {
         let mut tokens: Vec<&str> = Operator::ALL
             .iter()
-            .map(|op| op.canonical_token())
+            .filter_map(|op| op.canonical_token())
             .collect();
         tokens.sort_unstable();
         let distinct = tokens.len();
@@ -303,12 +411,14 @@ mod tests {
         assert_eq!(tokens.len(), distinct, "duplicate canonical token");
     }
 
-    /// A canonical token really is what the scanner finds at a site: re-scanning
-    /// each token in a trivial expression must rediscover the same operator.
+    /// Every operator really is what the scanner finds at a site: re-scanning a
+    /// minimal fixture for each must rediscover it. The fixture is chosen by
+    /// [`SiteKind`], so a new kind with no arm here falls into the catch-all and
+    /// fails loudly rather than silently going unchecked.
     #[test]
-    fn canonical_tokens_round_trip_through_the_scanner() {
+    fn every_operator_round_trips_through_the_scanner() {
         for operator in Operator::ALL {
-            let token = operator.canonical_token();
+            let token = operator.canonical_token().unwrap_or_default();
             let source = match operator.kind() {
                 SiteKind::BooleanLiteral => format!("fn f() -> bool {{ {token} }}\n"),
                 SiteKind::Constant => format!("fn f() -> i32 {{ {token} }}\n"),
@@ -320,6 +430,19 @@ mod tests {
                 // four predicates — the fixture never needs to type-check.
                 SiteKind::PredicateMethod => {
                     format!("fn f(x: Option<i32>) -> bool {{ x.{token}() }}\n")
+                }
+                SiteKind::UnwrapCall => format!("fn f(x: Option<i32>) -> i32 {{ x.{token}() }}\n"),
+                SiteKind::OptionConstructor => {
+                    "fn f(a: i32) -> Option<i32> { Some(a) }\n".to_owned()
+                }
+                SiteKind::ResultConstructor => {
+                    "fn f(a: i32) -> Result<i32, ()> { Ok(a) }\n".to_owned()
+                }
+                SiteKind::TryOperator => {
+                    "fn f(x: Option<i32>) -> Option<i32> { Some(x?) }\n".to_owned()
+                }
+                SiteKind::MatchArm => {
+                    "fn f(x: i32) -> i32 { match x { y if y > 7 => y, _ => x } }\n".to_owned()
                 }
                 _ => format!("fn f(a: i32, b: i32) -> i32 {{ (a {token} b) as i32 }}\n"),
             };
@@ -376,5 +499,10 @@ mod tests {
         assert_eq!(Operator::IsNone.kind(), SiteKind::PredicateMethod);
         assert_eq!(Operator::IsOk.kind(), SiteKind::PredicateMethod);
         assert_eq!(Operator::IsErr.kind(), SiteKind::PredicateMethod);
+        assert_eq!(Operator::SomeCall.kind(), SiteKind::OptionConstructor);
+        assert_eq!(Operator::OkCall.kind(), SiteKind::ResultConstructor);
+        assert_eq!(Operator::Unwrap.kind(), SiteKind::UnwrapCall);
+        assert_eq!(Operator::Try.kind(), SiteKind::TryOperator);
+        assert_eq!(Operator::ArmGuard.kind(), SiteKind::MatchArm);
     }
 }

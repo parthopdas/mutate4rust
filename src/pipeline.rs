@@ -159,6 +159,30 @@ fn check_baseline(runner: &TestRunner) -> Result<()> {
     Ok(())
 }
 
+/// The full source text of the mutant for one `site`, spliced from the pristine
+/// `original`.
+///
+/// The **single** point where a site becomes mutated bytes: slice the site's
+/// token, map it through [`operators::replacement`], splice the result back.
+/// Every later generalization of "what one site mutates" (T13c's multi-edit
+/// operators) changes this function and nothing else in the loop.
+///
+/// # Errors
+///
+/// Returns an error if the site's byte span is outside `original`, if the
+/// operator's mapping rejects the token (an internal invariant violation — our
+/// own scanner never emits such a site), or if the splice span is invalid.
+fn mutant_source(original: &str, site: &Site) -> Result<String> {
+    let token = original.get(site.byte_span.clone()).with_context(|| {
+        format!(
+            "mutation site at line {} has a byte span outside the source",
+            site.line
+        )
+    })?;
+    let replacement = operators::replacement(site.operator, token)?;
+    splice(original, &site.byte_span, &replacement)
+}
+
 /// Applies each selected site in turn, runs the suite, records the mutant, and
 /// restores the original bytes — once per iteration, including on the error path.
 ///
@@ -175,17 +199,18 @@ fn mutate_sites(
     for site in sites {
         // Everything up to `write_mutant` leaves the file pristine, so an early
         // `?` here needs no restore (and `Drop` is the backstop regardless).
-        let token = guard
-            .original()
-            .get(site.byte_span.clone())
-            .with_context(|| {
-                format!(
-                    "mutation site at line {} has a byte span outside the source",
-                    site.line
-                )
-            })?;
-        let replacement = operators::replacement(site.operator, token)?;
-        let mutated = splice(guard.original(), &site.byte_span, &replacement)?;
+        let mutated = match mutant_source(guard.original(), site) {
+            Ok(mutated) => mutated,
+            // Fail fast — silently skipping the site would hide exactly the class
+            // of bug this catches — but do not discard the mutants already run: a
+            // user deep into a long run gets the partial report in the error
+            // itself rather than losing all of it to an internal invariant
+            // violation.
+            Err(err) => bail!(
+                "{err:#}\n\npartial report for the mutants run before the abort:\n{}",
+                report.summary(),
+            ),
+        };
 
         guard.write_mutant(&mutated)?;
         let result = runner.run_and_classify();
@@ -207,7 +232,7 @@ mod tests {
     use crate::report::MutationReport;
     use crate::runner::TestRunner;
     use crate::scanner;
-    use crate::site::Operator;
+    use crate::site::{Operator, Site};
     use std::path::Path;
     use std::time::Duration;
 
@@ -497,6 +522,37 @@ mod tests {
             std::fs::read_to_string(&target).expect("read target"),
             TWO_SITE_SOURCE,
             "a mutant must never be left on disk when a runner error propagates",
+        );
+        drop(guard);
+    }
+
+    /// A mapping failure is an internal invariant violation — the `0f64` class of
+    /// bug. The run still fails fast (silently skipping the site would hide
+    /// exactly that class), but the mutants already run are handed back in the
+    /// error instead of being thrown away.
+    #[test]
+    fn a_mapping_failure_hands_back_the_partial_report() {
+        let (dir, runner) = seed(TWO_SITE_SOURCE, &shell("exit 0"));
+        let target = dir.path().join("target.rs");
+        let guard = RestoreGuard::new(&target).expect("read target");
+        let sites = scanner::scan_source(guard.original()).expect("parse target");
+        // A site claiming the line-2 `-` token is the integer constant `0`: one
+        // our own scanner never emits, so its mapping fails mid-loop.
+        let bogus = Site::new(Operator::Zero, sites[1].byte_span.clone(), 2, None);
+        let mut report = MutationReport::new("target.rs");
+
+        let err = mutate_sites(&guard, &[&sites[0], &bogus], &runner, &mut report)
+            .expect_err("the mapping failure must propagate");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Survived mutants:\n  target.rs:1"),
+            "the mutant already run must be reported before bailing: {message}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            TWO_SITE_SOURCE,
+            "the abort must still leave the target pristine",
         );
         drop(guard);
     }

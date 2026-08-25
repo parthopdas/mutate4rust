@@ -24,19 +24,28 @@
 //! Only the literal form is recognised (`#[cfg(test)]`); composite predicates such
 //! as `#[cfg(any(test, feature = "x"))]` are not treated as test-only.
 //!
-//! The gate is applied at four points — [`Visit::visit_item`],
-//! [`Visit::visit_trait_item`], [`Visit::visit_impl_item`] and
-//! [`Visit::visit_foreign_item`] — each reading its node's attributes through a
-//! single `match` over every variant of that enum. Those four are the item enums
-//! `syn` 3.0.4 declares in `item.rs`, so an item in a file — free, associated,
-//! trait or `extern` block — is reached through one of them, and there is no
-//! per-visitor list of gated node types to keep by hand (T13a; a hand-kept list
-//! is exactly what `declare_operators!` was introduced to abolish).
+//! The gate is applied at six points — [`Visit::visit_item`],
+//! [`Visit::visit_trait_item`], [`Visit::visit_impl_item`],
+//! [`Visit::visit_foreign_item`] (T13a) and [`Visit::visit_stmt`],
+//! [`Visit::visit_arm`] (T13b) — each reading its node's attributes through a
+//! single `match` over every variant of that enum. The first four are the item
+//! enums `syn` 3.0.4 declares in `item.rs`, so an item in a file — free,
+//! associated, trait or `extern` block — is reached through one of them, and
+//! there is no per-visitor list of gated node types to keep by hand (T13a; a
+//! hand-kept list is exactly what `declare_operators!` was introduced to
+//! abolish).
 //!
-//! This claims coverage of *items*, not of every position `syn` 3.0.4 attaches
-//! attributes to: that crate also carries `attrs` on `Stmt`, `Arm`, `Field`,
-//! `Variant`, `FnArg`, `GenericParam`, `WherePredicate`, `Pat` and `Type`, and a
-//! `#[cfg(test)]` there is **not** gated today.
+//! This claims coverage of *items*, statements and `match` arms, not of every
+//! position `syn` 3.0.4 attaches attributes to. The named remaining hole is the
+//! **expression statement**: in `#[cfg(test)] foo();` the attribute is parsed
+//! onto the `syn::Expr`, not onto the `syn::Stmt`, so [`stmt_attrs`] cannot see
+//! it and the call is still scanned. Closing it means reading attributes off
+//! every attribute-bearing `Expr` variant, which is a wider audit than T13b
+//! bought. `syn` 3.0.4 also carries `attrs` on `Field`, `Variant`, `FnArg`,
+//! `GenericParam`, `WherePredicate`, `Pat` and `Type`, and a `#[cfg(test)]`
+//! there is **not** gated today either.
+
+use std::ops::Range;
 
 use anyhow::{Context, Result};
 use proc_macro2::Span;
@@ -140,8 +149,19 @@ impl SiteCollector {
     }
 
     fn push_site(&mut self, operator: Operator, span: Span) {
-        let byte_span = span.byte_range();
-        let line = span.start().line;
+        self.push_span(operator, span.byte_range(), span.start().line);
+    }
+
+    /// Records a site from an **assembled** byte span.
+    ///
+    /// This exists solely because one T13b site has no single `syn::Span` that
+    /// describes it: a `match` arm's guard is `if <expr>`, and `syn` 3.0.4 models
+    /// it as [`syn::PatGuard`] — the `if` token and the guard expression are
+    /// separate nodes, and neither one alone covers the text the mutation drops.
+    /// The span is therefore built from the `if` token's start and the guard
+    /// expression's end. Every other site comes from exactly one `syn` span and
+    /// goes through [`SiteCollector::push_site`].
+    fn push_span(&mut self, operator: Operator, byte_span: Range<usize>, line: usize) {
         let function_id = self.function_id();
         self.sites
             .push(Site::new(operator, byte_span, line, function_id));
@@ -175,6 +195,53 @@ impl<'ast> Visit<'ast> for SiteCollector {
             return;
         }
         visit::visit_foreign_item(self, node);
+    }
+
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        if is_cfg_test(stmt_attrs(node)) {
+            return;
+        }
+        visit::visit_stmt(self, node);
+    }
+
+    /// **Sites live in expressions, never in types** — so the walk stops here and
+    /// does not recurse.
+    ///
+    /// A literal in type position is a compile-time constant: an array length
+    /// (`[u8; 1]`) or a const-generic argument. Mutating one is a near-certain
+    /// compile error — a wasted build scored `Killed`, i.e. score inflation with
+    /// zero signal (design: "Sites live in expressions, never in types").
+    ///
+    /// This deliberately reduces site counts and is human-approved. Array
+    /// **repeat expressions** (`[0u8; 1]`) are unaffected: they are
+    /// [`syn::ExprRepeat`], reached through `visit_expr`, and both the element and
+    /// the repeat length stay in scope.
+    fn visit_type(&mut self, _node: &'ast syn::Type) {}
+
+    /// A `match` arm. Gated for `#[cfg(test)]` like any other attribute-bearing
+    /// node, and the source of the [`Operator::ArmGuard`] site.
+    ///
+    /// **O3 — deliberate span overlap.** A multi-token guard emits *both* an
+    /// `ArmGuard` site covering the whole `if <guard>` *and* the operator sites
+    /// nested inside the guard expression, whose spans lie strictly within it.
+    /// That is intended, not a bug: mutants are applied **one at a time**, each
+    /// spliced over pristine source, so two overlapping sites never collide —
+    /// they are simply two independent mutants. Combining or de-duplicating
+    /// overlapping spans would require the multi-span edit model, which is T13c.
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        if let syn::Pat::Guard(guard) = &node.pat {
+            let start = guard.if_token.span().byte_range().start;
+            let end = guard.guard.span().byte_range().end;
+            self.push_span(
+                Operator::ArmGuard,
+                start..end,
+                guard.if_token.span().start().line,
+            );
+        }
+        visit::visit_arm(self, node);
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -221,14 +288,39 @@ impl<'ast> Visit<'ast> for SiteCollector {
         visit::visit_expr_binary(self, node);
     }
 
-    /// A zero-argument predicate call (`x.is_some()`) is a site whose span is the
-    /// **method name identifier only**, so the mutation stays a single-token
-    /// replacement.
+    /// A zero-argument method call (`x.is_some()`, `x.unwrap()`) is a site whose
+    /// span is the **method name identifier only**, so the mutation stays a
+    /// single-token replacement.
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if let Some(operator) = predicate_method_operator(node) {
+        if let Some(operator) = method_call_operator(node) {
             self.push_site(operator, node.method.span());
         }
         visit::visit_expr_method_call(self, node);
+    }
+
+    /// `Some(x)` and `Ok(x)` constructor calls.
+    ///
+    /// The two take **different spans**, because each one's mapping needs a
+    /// different amount of source replaced: `Some(x) → None` discards the bound
+    /// value, so the span is the **whole call expression**; `Ok(x) → Err(x)`
+    /// keeps it, so the span is the **`Ok` identifier alone** and the argument
+    /// list survives the splice untouched.
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let Some(segment) = unary_constructor_segment(node) {
+            match segment.ident.to_string().as_str() {
+                "Some" => self.push_site(Operator::SomeCall, node.span()),
+                "Ok" => self.push_site(Operator::OkCall, segment.ident.span()),
+                _ => {}
+            }
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    /// The `?` operator. The span is the **`?` token only**, which the mapping
+    /// replaces with `.unwrap()` — the receiver expression is left untouched.
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        self.push_site(Operator::Try, node.question_token.span());
+        visit::visit_expr_try(self, node);
     }
 
     fn visit_lit_bool(&mut self, node: &'ast syn::LitBool) {
@@ -308,11 +400,45 @@ fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes of any `syn::Stmt`, matched variant by variant.
+///
+/// Unlike the item enums, `syn::Stmt` is **not** `#[non_exhaustive]` in 3.0.4, so
+/// this match is exhaustive by the compiler and needs no wildcard: a `syn` bump
+/// that adds a variant is a build error here, which is the enforcement the item
+/// enums cannot have.
+///
+/// Only `Stmt::Local` contributes attributes. The other three yield **no
+/// attributes** — "keep scanning" — for reasons that differ, so they are
+/// enumerated explicitly rather than collapsed into a wildcard (design: enumerate
+/// the known variants anyway, so the audited set is readable in one place):
+/// `Stmt::Item`'s attributes are the item's own and are already read by
+/// [`item_attrs`] through [`Visit::visit_item`]; `Stmt::Expr` carries its
+/// attributes on the `syn::Expr`, not on the statement — the expression-statement
+/// hole named in the module docs; and `Stmt::Macro`'s body is an unexpanded token
+/// stream the scanner never descends into, so gating it would suppress nothing.
+fn stmt_attrs(stmt: &syn::Stmt) -> &[syn::Attribute] {
+    match stmt {
+        syn::Stmt::Local(node) => &node.attrs,
+        syn::Stmt::Item(_) | syn::Stmt::Expr(_, _) | syn::Stmt::Macro(_) => &[],
+    }
+}
+
 /// The attributes of any `syn::ForeignItem` — see [`item_attrs`] for the shape.
 ///
-/// An `extern` block's items reach the scanner because a declaration's *type* can
-/// hold an expression: the array length in `static X: [u8; 1];` is a `LitInt` the
-/// visitor walks into.
+/// This gate is **vacuous** as of T13b. An `extern` block's items used to reach
+/// the scanner because a declaration's *type* can hold an expression — the array
+/// length in `static X: [u8; 1];` was a `LitInt` the visitor walked into — but
+/// [`Visit::visit_type`] no longer recurses, so nothing inside a foreign item is
+/// a site with or without the attribute. Deleting this gate's effect leaves the
+/// suite green.
+///
+/// It stays by **human approval**: it costs nothing, and it keeps the four item
+/// enums covered uniformly rather than leaving one conspicuous gap for a reader
+/// to re-derive. Note what it does *not* buy — a future `syn` bump that adds a
+/// `ForeignItem` variant will **not** be re-validated by this gate, because there
+/// is no site behind it to lose. `a_foreign_item_holds_no_site_with_or_without_
+/// the_attribute` pins the emptiness itself, and that test does have teeth: it
+/// fails if [`Visit::visit_type`] starts recursing again.
 fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
     match item {
         syn::ForeignItem::Fn(node) => &node.attrs,
@@ -374,19 +500,24 @@ fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
     }
 }
 
-/// Maps a zero-argument predicate call onto its [`Operator`], or `None` when the
+/// Maps a zero-argument method call onto its [`Operator`], or `None` when the
 /// call is anything else.
 ///
 /// **Preconditions:** the call must have **no arguments** and **no turbofish** —
 /// a same-named method taking arguments or explicit generics is a different
-/// method, and swapping its name would be a knowingly non-compiling mutant.
+/// method, and swapping its name would be a knowingly non-compiling mutant. The
+/// arity rule is why `.expect("boom")` yields no site: it is not `.unwrap()` with
+/// a message, it is a different method, and `expect(m) → unwrap_or_default()`
+/// would leave a stray argument behind.
 ///
 /// **No receiver type inference is attempted.** mutate4rust is a *syntactic*
 /// tool: it has no type information, so a user-defined `is_some()` on an
 /// unrelated type is mutated just like `Option::is_some`. That is accepted and
 /// consistent with the rest of the scanner — the mutant either fails to compile
-/// (scored Killed, A8) or is a genuine test of that predicate.
-fn predicate_method_operator(call: &syn::ExprMethodCall) -> Option<Operator> {
+/// (scored Killed, A8) or is a genuine test of that predicate. The same holds for
+/// `unwrap → unwrap_or_default`, whose real precondition (`T: Default`) is
+/// undecidable without types.
+fn method_call_operator(call: &syn::ExprMethodCall) -> Option<Operator> {
     if !call.args.is_empty() || call.turbofish.is_some() {
         return None;
     }
@@ -395,8 +526,43 @@ fn predicate_method_operator(call: &syn::ExprMethodCall) -> Option<Operator> {
         "is_none" => Some(Operator::IsNone),
         "is_ok" => Some(Operator::IsOk),
         "is_err" => Some(Operator::IsErr),
+        "unwrap" => Some(Operator::Unwrap),
         _ => None,
     }
+}
+
+/// The final path segment of a **one-argument plain-path call** — the shape
+/// `Some(x)` / `Ok(x)` / `Option::Some(x)` must have to be a constructor site —
+/// or `None` for any other call.
+///
+/// The preconditions are exactly the ones decidable **syntactically**, without
+/// type information:
+/// - **arity 1**: `Some()` or `Ok(a, b)` is not the constructor, whatever it is.
+/// - **no turbofish**: `Some::<i32>(x) → None` would leave the generic arguments
+///   dangling on a variant that takes none.
+/// - **no `QSelf`**: `<T as Trait>::Some(x)` is a trait-associated function that
+///   merely shares the name, not the `Option` constructor.
+///
+/// A *module*-qualified path (`Option::Some(2)`) **is** accepted — only the last
+/// segment names the constructor, and both mappings are correct under it: the
+/// whole-call span swallows the qualifier for `Some`, and replacing the `Ok`
+/// identifier alone leaves `Result::Err(x)`.
+///
+/// Whether the path actually resolves to `core::option::Option::Some` is *not*
+/// decidable here (A8): a user-defined `Some` is mutated too, and its mutant is
+/// scored `Killed` if it fails to compile.
+fn unary_constructor_segment(call: &syn::ExprCall) -> Option<&syn::PathSegment> {
+    if call.args.len() != 1 {
+        return None;
+    }
+    let syn::Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let segment = path.path.segments.last()?;
+    matches!(segment.arguments, syn::PathArguments::None).then_some(segment)
 }
 
 /// Maps an integer literal whose base-10 value is `0` or `1` onto the matching
@@ -1058,17 +1224,34 @@ mod tests {
         );
     }
 
-    /// The holes the single `visit_item` / `visit_trait_item` / `visit_impl_item`
-    /// / `visit_foreign_item` gate closes at T13a: before it, `#[cfg(test)]` was
-    /// checked only on free functions, impl methods, impl blocks and modules, so a
-    /// test-only **trait**, **trait method**, **`extern` declaration**, or
-    /// module-level **`const`/`static`** still contributed sites.
+    /// The holes the `#[cfg(test)]` gate closes, one row per *position* an
+    /// attribute can sit in and still suppress a site.
     ///
-    /// Each case pairs the attributed body with the **identical body lacking the
-    /// attribute**, so a passing assertion can only mean the *attribute*
-    /// suppressed discovery — not that the scanner never looked there.
+    /// At T13a this covered the four item enums (`visit_item` /
+    /// `visit_trait_item` / `visit_impl_item` / `visit_foreign_item`): before
+    /// them, `#[cfg(test)]` was checked only on free functions, impl methods,
+    /// impl blocks and modules, so a test-only **trait**, **trait method**, or
+    /// module-level **`const`/`static`** still contributed sites. T13b renamed
+    /// the test from `..._every_item_kind_...` and added the **`Stmt::Local`**
+    /// and **`Arm`** rows for its two new gates.
+    ///
+    /// Each row pairs the attributed construct with the **identical body lacking
+    /// the attribute**, so a row can never pass by asserting emptiness against
+    /// emptiness: the control proves the fixture really does hold a site, and
+    /// only then does the attributed form have to suppress it. A passing
+    /// assertion therefore means the *attribute* suppressed discovery — not that
+    /// the scanner never looked there. This is the enforcement for a foreign
+    /// `#[non_exhaustive]` domain that neither construction nor the compiler can
+    /// provide (design: "make the test the enforcement"), and it is the artifact
+    /// a `syn` bump must be re-run against.
+    ///
+    /// The two T13a **foreign-item** rows were removed at T13b: once
+    /// [`Visit::visit_type`] stopped recursing, their controls held no site
+    /// either, so both sides were empty and the rows asserted nothing. The
+    /// emptiness they used to imply is now pinned directly by
+    /// [`a_foreign_item_holds_no_site_with_or_without_the_attribute`].
     #[test]
-    fn cfg_test_suppresses_every_item_kind_that_can_hold_a_site() {
+    fn cfg_test_suppresses_every_position_that_can_hold_a_site() {
         for (attributed, control, what) in [
             (
                 concat!(
@@ -1142,23 +1325,39 @@ mod tests {
             ),
             (
                 concat!(
-                    "unsafe extern \"C\" {\n",
+                    "fn outer(a: i32, b: i32) -> i32 {\n",
                     "    #[cfg(test)]\n",
-                    "    static X: [u8; 1];\n",
+                    "    let _k = a + b;\n",
+                    "    2\n",
                     "}\n",
                 ),
-                concat!("unsafe extern \"C\" {\n", "    static X: [u8; 1];\n", "}\n",),
-                "a test-only foreign static",
+                concat!(
+                    "fn outer(a: i32, b: i32) -> i32 {\n",
+                    "    let _k = a + b;\n",
+                    "    2\n",
+                    "}\n",
+                ),
+                "a test-only `let` statement",
             ),
             (
                 concat!(
-                    "unsafe extern \"C\" {\n",
-                    "    #[cfg(test)]\n",
-                    "    fn g() -> [u8; 1];\n",
+                    "fn outer(x: i32) -> i32 {\n",
+                    "    match x {\n",
+                    "        #[cfg(test)]\n",
+                    "        y => y + 1,\n",
+                    "        _ => x,\n",
+                    "    }\n",
                     "}\n",
                 ),
-                concat!("unsafe extern \"C\" {\n", "    fn g() -> [u8; 1];\n", "}\n",),
-                "a test-only foreign function",
+                concat!(
+                    "fn outer(x: i32) -> i32 {\n",
+                    "    match x {\n",
+                    "        y => y + 1,\n",
+                    "        _ => x,\n",
+                    "    }\n",
+                    "}\n",
+                ),
+                "a test-only `match` arm",
             ),
         ] {
             assert!(
@@ -1274,5 +1473,447 @@ mod tests {
         // Empty input is a valid (empty) Rust file, exactly as `scan_source` sees it.
         assert!(validate_source("").is_ok());
         assert!(scan_source("").is_ok());
+    }
+
+    /// The mutant source a real run would write: the site's span replaced by its
+    /// operator's mapping, spliced over the pristine bytes.
+    fn splice(source: &str, site: &Site) -> String {
+        let replacement = crate::operators::replacement(site.operator, span_text(source, site))
+            .expect("mapping should succeed");
+        format!(
+            "{}{replacement}{}",
+            &source[..site.byte_span.start],
+            &source[site.byte_span.end..],
+        )
+    }
+
+    /// The one [`Operator::ArmGuard`] site in `source`, asserting there is
+    /// exactly one so a fixture can never silently grow a second guard.
+    fn arm_guard_site(source: &str) -> Site {
+        let mut guards = scan(source)
+            .into_iter()
+            .filter(|site| site.operator == Operator::ArmGuard);
+        let site = guards.next().expect("an arm guard site");
+        assert!(guards.next().is_none(), "exactly one arm guard expected");
+        site
+    }
+
+    /// Sites live in expressions, never in types: `visit_type` does not recurse.
+    ///
+    /// Not tautological — the control scans the *same* literals in **expression**
+    /// position and requires them to be sites, so this cannot pass merely because
+    /// `0`/`1` went out of scope everywhere. Restoring the recursion makes the
+    /// five type-position literals below into five sites and fails the assertion.
+    #[test]
+    fn no_site_is_emitted_inside_a_type() {
+        // Every `0`/`1` here sits in type position: a field type, a parameter
+        // type, a return type, a type alias, and a static's type.
+        let types = concat!(
+            "struct S {\n",
+            "    a: [u8; 1],\n",
+            "}\n",
+            "fn f(x: [i32; 1]) -> [i32; 1] {\n",
+            "    x\n",
+            "}\n",
+            "type A = [u8; 0];\n",
+            "static B: [u8; 1] = [7u8];\n",
+        );
+        let control = concat!("fn g() -> i32 { 1 }\n", "fn h() -> i32 { 0 }\n");
+
+        assert_eq!(
+            scan(control).len(),
+            2,
+            "control: the same literals in expression position must be sites",
+        );
+        assert!(
+            scan(types).is_empty(),
+            "a literal in type position must contribute no site, got {:?}",
+            scan(types),
+        );
+    }
+
+    /// An array **repeat expression** is an expression and stays in scope, even
+    /// though it looks like an array type.
+    ///
+    /// Both halves are sites — the element and the repeat length — while the
+    /// identical literal in **return-type** position contributes nothing. That
+    /// asymmetry is the whole point: 2 sites, not 3. A recursing `visit_type`
+    /// scores 3 here.
+    #[test]
+    fn array_repeat_expressions_stay_in_scope() {
+        let source = "fn f() -> [u8; 1] { [0u8; 1] }\n";
+        let sites = scan(source);
+
+        assert_eq!(
+            sites.iter().map(|s| s.operator).collect::<Vec<_>>(),
+            vec![Operator::Zero, Operator::One],
+            "the repeat element and length are sites; the return type is not",
+        );
+        assert_eq!(span_text(source, &sites[0]), "0u8");
+        assert_eq!(span_text(source, &sites[1]), "1");
+    }
+
+    /// A foreign item holds no site at all now that `visit_type` does not
+    /// recurse — with **or** without `#[cfg(test)]`.
+    ///
+    /// This is what makes [`foreign_item_attrs`]'s gate vacuous, and it is not a
+    /// vacuous test: it pins the emptiness itself, so it fails the moment
+    /// `visit_type` starts recursing again and the array lengths below become
+    /// sites.
+    #[test]
+    fn a_foreign_item_holds_no_site_with_or_without_the_attribute() {
+        for (source, what) in [
+            (
+                concat!("unsafe extern \"C\" {\n", "    static X: [u8; 1];\n", "}\n"),
+                "a foreign static",
+            ),
+            (
+                concat!(
+                    "unsafe extern \"C\" {\n",
+                    "    #[cfg(test)]\n",
+                    "    static X: [u8; 1];\n",
+                    "}\n",
+                ),
+                "a test-only foreign static",
+            ),
+            (
+                concat!("unsafe extern \"C\" {\n", "    fn g() -> [u8; 1];\n", "}\n"),
+                "a foreign function",
+            ),
+            (
+                concat!(
+                    "unsafe extern \"C\" {\n",
+                    "    #[cfg(test)]\n",
+                    "    fn g() -> [u8; 1];\n",
+                    "}\n",
+                ),
+                "a test-only foreign function",
+            ),
+        ] {
+            assert!(
+                scan(source).is_empty(),
+                "{what} must contribute no site, got {:?}",
+                scan(source),
+            );
+        }
+    }
+
+    /// Each structural S6 site spans **exactly** the text its mapping replaces —
+    /// no more, no less. The spans differ per operator by design, so this pins
+    /// each one separately.
+    #[test]
+    fn structural_operator_spans_cover_exactly_what_the_mutation_replaces() {
+        for (source, operator, expected, what) in [
+            (
+                "fn f(a: i32) -> Option<i32> { Some(a) }\n",
+                Operator::SomeCall,
+                "Some(a)",
+                "`Some(x)` spans the whole call, because `None` discards the value",
+            ),
+            (
+                "fn f() -> Option<i32> { Option::Some(2) }\n",
+                Operator::SomeCall,
+                "Option::Some(2)",
+                "a module-qualified `Some` still spans the whole call",
+            ),
+            (
+                "fn f(a: i32) -> Result<i32, ()> { Ok(a) }\n",
+                Operator::OkCall,
+                "Ok",
+                "`Ok(x)` spans the identifier only, so the value survives into `Err(x)`",
+            ),
+            (
+                "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
+                Operator::Unwrap,
+                "unwrap",
+                "`.unwrap()` spans the method name only",
+            ),
+            (
+                "fn f(x: Option<i32>) -> Option<i32> { x?; x }\n",
+                Operator::Try,
+                "?",
+                "`?` spans the token only, leaving the receiver untouched",
+            ),
+            (
+                "fn f(x: i32) -> i32 { match x { y if y > 7 => y, _ => x } }\n",
+                Operator::ArmGuard,
+                "if y > 7",
+                "an arm guard spans `if <guard>` whole",
+            ),
+        ] {
+            let sites = scan(source);
+            let site = sites
+                .iter()
+                .find(|site| site.operator == operator)
+                .unwrap_or_else(|| panic!("{operator:?} not discovered in `{source}`"));
+            assert_eq!(span_text(source, site), expected, "{what}");
+        }
+    }
+
+    /// The syntactically-decidable preconditions really are enforced.
+    ///
+    /// Each row pairs a form that must emit **no** site with the near-miss
+    /// **control** that must emit one, so a row cannot pass because the scanner
+    /// never looked at that shape at all.
+    #[test]
+    fn structural_forms_outside_the_precondition_emit_no_sites() {
+        for (source, control, what) in [
+            (
+                "fn f(a: i32) -> Option<i32> { Some::<i32>(a) }\n",
+                "fn f(a: i32) -> Option<i32> { Some(a) }\n",
+                "a turbofished `Some` would leave generics on a variant taking none",
+            ),
+            (
+                "fn f(a: i32) -> i32 { <S as T>::Some(a) }\n",
+                "fn f(a: i32) -> Option<i32> { Some(a) }\n",
+                "a `QSelf`-qualified path merely shares the name",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> R { Ok(a, b) }\n",
+                "fn f(a: i32) -> Result<i32, ()> { Ok(a) }\n",
+                "a two-argument `Ok` is not the constructor",
+            ),
+            (
+                "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+                "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
+                "`.expect(m)` takes an argument, so it is not `.unwrap()`",
+            ),
+            (
+                "fn f(x: i32) -> i32 { match x { y => y, _ => x } }\n",
+                "fn f(x: i32, c: bool) -> i32 { match x { y if c => y, _ => x } }\n",
+                "an arm without a guard has nothing to drop",
+            ),
+        ] {
+            assert!(
+                !scan(control).is_empty(),
+                "control: {what} — the in-precondition form must be a site",
+            );
+            assert!(scan(source).is_empty(), "{what}, got {:?}", scan(source),);
+        }
+    }
+
+    /// Composition proof for every structural S6 row: the span the scanner
+    /// reports, replaced by the operator's mapping, yields exactly these bytes —
+    /// the mutant a real run would write to disk.
+    #[test]
+    fn s6_structural_spans_and_mappings_compose_into_the_expected_mutant_source() {
+        for (source, expected) in [
+            (
+                "fn f(a: i32) -> Option<i32> { Some(a) }\n",
+                "fn f(a: i32) -> Option<i32> { None }\n",
+            ),
+            (
+                "fn f() -> Option<i32> { Option::Some(2) }\n",
+                "fn f() -> Option<i32> { None }\n",
+            ),
+            (
+                "fn f(a: i32) -> Result<i32, ()> { Ok(a) }\n",
+                "fn f(a: i32) -> Result<i32, ()> { Err(a) }\n",
+            ),
+            (
+                "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
+                "fn f(x: Option<i32>) -> i32 { x.unwrap_or_default() }\n",
+            ),
+            (
+                "fn f(x: Option<i32>) -> Option<i32> { x?; x }\n",
+                "fn f(x: Option<i32>) -> Option<i32> { x.unwrap(); x }\n",
+            ),
+            // Dropping the guard leaves the pattern and body untouched — and the
+            // space the `if` used to occupy, which is harmless to `rustc`.
+            (
+                "fn f(x: i32, c: bool) -> i32 { match x { y if c => y, _ => x } }\n",
+                "fn f(x: i32, c: bool) -> i32 { match x { y  => y, _ => x } }\n",
+            ),
+        ] {
+            let sites = scan(source);
+            assert_eq!(sites.len(), 1, "one site expected in `{source}`");
+            assert_eq!(splice(source, &sites[0]), expected);
+        }
+    }
+
+    /// The **assembled** arm-guard span (the one construction with no single
+    /// `syn::Span`) covers a multi-token guard whole, across every shape a guard
+    /// can take.
+    ///
+    /// Per row: the span text is the entire guard; the splice is exactly the
+    /// expected source; and that source **parses**. The parse check is what gives
+    /// the test teeth — a span truncated to any prefix of the guard leaves the
+    /// remaining tokens stranded between the pattern and the `=>`, which
+    /// `syn::parse_file` genuinely rejects. `assert_eq!` runs first so a failure
+    /// reports the wrong bytes rather than a bare parse error.
+    #[test]
+    fn the_assembled_arm_guard_span_covers_a_multi_token_guard_whole() {
+        for (source, guard, expected, what) in [
+            (
+                "fn f(a: i32, b: i32, x: i32) -> i32 { match x { y if a > b => y, _ => x } }\n",
+                "if a > b",
+                "fn f(a: i32, b: i32, x: i32) -> i32 { match x { y  => y, _ => x } }\n",
+                "a binary comparison",
+            ),
+            (
+                "fn f(s: &str, x: i32) -> i32 { match x { y if s.starts_with('a') => y, _ => x } }\n",
+                "if s.starts_with('a')",
+                "fn f(s: &str, x: i32) -> i32 { match x { y  => y, _ => x } }\n",
+                "a method call",
+            ),
+            (
+                "fn f(a: i32, b: i32, x: i32) -> i32 { match x { y if (a > b) => y, _ => x } }\n",
+                "if (a > b)",
+                "fn f(a: i32, b: i32, x: i32) -> i32 { match x { y  => y, _ => x } }\n",
+                "a parenthesised guard",
+            ),
+            (
+                "fn f(a: bool, b: bool, x: i32) -> i32 { match x { y if a && b => y, _ => x } }\n",
+                "if a && b",
+                "fn f(a: bool, b: bool, x: i32) -> i32 { match x { y  => y, _ => x } }\n",
+                "an `&&`-chained guard",
+            ),
+        ] {
+            let site = arm_guard_site(source);
+            assert_eq!(span_text(source, &site), guard, "{what}: span text");
+
+            let mutated = splice(source, &site);
+            assert_eq!(mutated, expected, "{what}: mutant source");
+            assert!(
+                syn::parse_file(&mutated).is_ok(),
+                "{what}: the mutant must be valid Rust",
+            );
+        }
+    }
+
+    /// O3: a multi-token guard emits **both** its own `ArmGuard` site and the
+    /// operator sites nested inside it, with overlapping byte spans.
+    ///
+    /// This is deliberate. Mutants are applied one at a time, each spliced over
+    /// pristine source, so overlapping sites never collide — they are two
+    /// independent mutants. Combining spans is T13c.
+    #[test]
+    fn a_guard_emits_its_own_site_and_the_operator_sites_nested_inside_it() {
+        let source =
+            "fn f(a: i32, b: i32, x: i32) -> i32 { match x { y if a > b => y, _ => x } }\n";
+        let sites = scan(source);
+
+        assert_eq!(
+            sites.iter().map(|s| s.operator).collect::<Vec<_>>(),
+            vec![Operator::ArmGuard, Operator::Greater],
+        );
+
+        let guard = &sites[0];
+        let nested = &sites[1];
+        assert_eq!(span_text(source, guard), "if a > b");
+        assert_eq!(span_text(source, nested), ">");
+        assert!(
+            guard.byte_span.start < nested.byte_span.start
+                && nested.byte_span.end < guard.byte_span.end,
+            "the operator span {:?} must sit strictly inside the guard span {:?}",
+            nested.byte_span,
+            guard.byte_span,
+        );
+    }
+
+    /// `Some`/`Ok` in **pattern** position bind a value; they construct nothing,
+    /// so mutating them would be nonsense. Each row is paired with the same
+    /// constructor in **expression** position as a control.
+    #[test]
+    fn constructors_in_pattern_position_are_not_sites() {
+        for (pattern, control, what) in [
+            (
+                "fn f(x: Option<i32>, d: i32) -> i32 { match x { Some(v) => v, None => d } }\n",
+                "fn f(v: i32) -> Option<i32> { Some(v) }\n",
+                "`Some(v)` in a match arm",
+            ),
+            (
+                "fn f(x: Result<i32, ()>, d: i32) -> i32 { match x { Ok(v) => v, Err(_) => d } }\n",
+                "fn f(v: i32) -> Result<i32, ()> { Ok(v) }\n",
+                "`Ok(v)` in a match arm",
+            ),
+            (
+                "fn f(x: Option<i32>, d: i32) -> i32 { if let Some(v) = x { v } else { d } }\n",
+                "fn f(v: i32) -> Option<i32> { Some(v) }\n",
+                "`Some(v)` in an `if let`",
+            ),
+        ] {
+            assert!(
+                !scan(control).is_empty(),
+                "control: {what} — the expression form must be a site",
+            );
+            assert!(
+                scan(pattern).is_empty(),
+                "{what} must contribute no site, got {:?}",
+                scan(pattern),
+            );
+        }
+    }
+
+    /// Sources exercising every shape the scanner can emit a site for, plus the
+    /// near-miss spellings it must **refuse** to emit.
+    ///
+    /// Deliberately includes forms whose mapping would *fail* if the scanner
+    /// wrongly emitted them — `0f64` is a `syn::LitInt` with a float suffix, and
+    /// emitting it as an integer constant makes `replacement` reject the token.
+    const TOTALITY_CORPUS: &[&str] = &[
+        "fn f(a: i32, b: i32) -> i32 { a + b - a * b / a % b }\n",
+        "fn f(mut a: i32, b: i32) { a += b; a -= b; a *= b; a /= b; a %= b; }\n",
+        "fn f(a: i32, b: i32) -> bool { a > b && a >= b || a < b && a <= b }\n",
+        "fn f(a: i32, b: i32) -> bool { a == b || a != b }\n",
+        "fn f() -> bool { true || false }\n",
+        "fn f() -> i32 { 0 + 1 }\n",
+        "fn f() -> i32 { 0x1 + 0b0 + 1u8 as i32 + 0usize as i32 }\n",
+        "fn f() -> f64 { 0.0 + 1.0 }\n",
+        "fn f() -> f32 { 0.0f32 + 1.0_f32 }\n",
+        // Refused spellings: a float-suffixed integer literal, and the float
+        // forms outside the plain-decimal precondition.
+        "fn f() -> f64 { 0f64 }\n",
+        "fn f() -> f64 { 1e0 + 0. + 1.0e3 }\n",
+        "fn f(a: i32, b: i32) -> i32 { a & b | a ^ b }\n",
+        "fn f(a: i32, b: i32) -> i32 { (a << b) + (a >> b) }\n",
+        "fn f(o: Option<i32>, r: Result<i32, ()>) -> bool { o.is_some() && o.is_none() }\n",
+        "fn f(r: Result<i32, ()>) -> bool { r.is_ok() && r.is_err() }\n",
+        "fn f(a: i32) -> Option<i32> { Some(a) }\n",
+        "fn f() -> Option<i32> { Option::Some(2) }\n",
+        "fn f(a: i32) -> Result<i32, ()> { Ok(a) }\n",
+        "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
+        "fn f(x: Option<i32>) -> Option<i32> { Some(x?) }\n",
+        "fn f(x: i32) -> i32 { match x { y if y > 7 => y, _ => x } }\n",
+        "fn f() -> [u8; 1] { [0u8; 1] }\n",
+        "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+        "unsafe extern \"C\" {\n    static X: [u8; 1];\n}\n",
+    ];
+
+    /// **Totality of the mapping over what the scanner emits.**
+    ///
+    /// Two properties in one, and they pull against each other, which is the
+    /// point:
+    /// - *Over-emission fails loudly*: every site the scanner emits must map
+    ///   successfully. A site whose token `replacement` rejects — a `0f64`
+    ///   emitted as an integer constant, say — fails here rather than surviving
+    ///   to become a run-time mapping error mid-run.
+    /// - *Under-emission fails loudly*: the corpus must collectively emit **every**
+    ///   operator in [`Operator::ALL`]. Silently dropping a shape from discovery
+    ///   would otherwise just make coverage rows quietly disappear.
+    #[test]
+    fn every_emitted_site_has_a_successful_mapping() {
+        let mut seen: Vec<Operator> = Vec::new();
+
+        for source in TOTALITY_CORPUS {
+            for site in scan(source) {
+                let token = span_text(source, &site);
+                assert!(
+                    crate::operators::replacement(site.operator, token).is_ok(),
+                    "{:?} emitted `{token}` in `{source}`, which has no mapping",
+                    site.operator,
+                );
+                if !seen.contains(&site.operator) {
+                    seen.push(site.operator);
+                }
+            }
+        }
+
+        for operator in Operator::ALL {
+            assert!(
+                seen.contains(&operator),
+                "no corpus source emits {operator:?} — discovery for it is unpinned",
+            );
+        }
     }
 }

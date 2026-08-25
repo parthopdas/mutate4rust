@@ -56,17 +56,21 @@ impl MutantRecord {
         self.result.bucket()
     }
 
-    /// One rendered line, e.g. ``src/lib.rs:11 Arithmetic `*` (arithmetic-panic)``.
+    /// One rendered line, e.g.
+    /// ``src/lib.rs:11 Arithmetic `*` → `/` (arithmetic-panic)``.
+    ///
+    /// The mutation is described rather than named by its token: a structural
+    /// operator's replacement is not a function of any token (T13b).
     fn render(&self, file: &str) -> String {
         let reason = match self.result {
             MutantResult::Killed(reason) => format!(" ({})", reason.label()),
             MutantResult::Survived | MutantResult::Uncovered => String::new(),
         };
         format!(
-            "  {file}:{} {:?} `{}`{reason}",
+            "  {file}:{} {:?} {}{reason}",
             self.line,
             self.operator.kind(),
-            self.operator.canonical_token(),
+            self.operator.description(),
         )
     }
 }
@@ -170,18 +174,17 @@ impl MutationReport {
     /// included): the bucket tallies with the kill breakdown, then the survivor
     /// and uncovered listings — each omitted when empty.
     pub(crate) fn summary(&self) -> String {
+        let breakdown: Vec<String> = KillReason::ALL
+            .iter()
+            .map(|reason| format!("{} {}", self.killed_by(*reason), reason.label()))
+            .collect();
         let mut summary = format!(
-            "Killed:    {} ({} {}, {} {}, {} {})\n\
+            "Killed:    {} ({})\n\
              Survived:  {}\n\
              Uncovered: {}\n\
              Score:     {}\n",
             self.killed(),
-            self.killed_by(KillReason::TestFailure),
-            KillReason::TestFailure.label(),
-            self.killed_by(KillReason::ArithmeticPanic),
-            KillReason::ArithmeticPanic.label(),
-            self.killed_by(KillReason::Timeout),
-            KillReason::Timeout.label(),
+            breakdown.join(", "),
             self.survived(),
             self.uncovered(),
             self.score_line(),
@@ -301,22 +304,51 @@ mod tests {
         assert_eq!(report_of(&[MutantResult::Survived]).score(), Some(0.0));
     }
 
-    /// A8: every kill reason counts toward the SAME bucket, and the breakdown
-    /// adds back up to it.
+    /// A8: every kill reason counts toward the SAME bucket, and the **rendered**
+    /// breakdown adds back up to it.
+    ///
+    /// The records are built from [`KillReason::ALL`], and the total is summed
+    /// from the columns the report actually printed — so a reason that is
+    /// declared but unrendered (or double-counted) fails here rather than
+    /// silently shrinking the user's report.
     #[test]
     fn the_kill_breakdown_sums_to_the_killed_bucket() {
-        let report = report_of(&[
-            KILLED,
-            MutantResult::Killed(KillReason::ArithmeticPanic),
-            MutantResult::Killed(KillReason::ArithmeticPanic),
-            MutantResult::Killed(KillReason::Timeout),
-        ]);
+        // One record per reason plus a repeat of the first, so the columns are
+        // not all 1 and two mis-tallied columns cannot cancel out.
+        let mut results: Vec<MutantResult> = KillReason::ALL.map(MutantResult::Killed).to_vec();
+        results.push(MutantResult::Killed(KillReason::ALL[0]));
+        let report = report_of(&results);
 
-        assert_eq!(report.killed(), 4);
+        let summary = report.summary();
+        let columns = breakdown_columns(&summary);
         assert_eq!(
-            report.summary().lines().next(),
-            Some("Killed:    4 (1 test-failure, 2 arithmetic-panic, 1 timeout)"),
+            columns.len(),
+            KillReason::ALL.len(),
+            "one column per declared reason: {summary}",
         );
+        for (reason, (count, label)) in KillReason::ALL.iter().zip(&columns) {
+            assert_eq!(*label, reason.label(), "{summary}");
+            assert_eq!(*count, report.killed_by(*reason), "{summary}");
+        }
+        assert_eq!(
+            columns.iter().map(|(count, _)| count).sum::<usize>(),
+            report.killed(),
+            "the breakdown must sum to the killed bucket: {summary}",
+        );
+    }
+
+    /// The `(n label, n label, …)` columns of a summary's `Killed:` line.
+    fn breakdown_columns(summary: &str) -> Vec<(usize, &str)> {
+        let line = summary.lines().next().expect("a Killed: line");
+        let start = line.find('(').expect("an opening paren") + 1;
+        let end = line.rfind(')').expect("a closing paren");
+        line[start..end]
+            .split(", ")
+            .map(|column| {
+                let (count, label) = column.split_once(' ').expect("`<count> <label>`");
+                (count.parse().expect("a numeric count"), label)
+            })
+            .collect()
     }
 
     /// The records carry the three things the human asked for — `file:line`,
@@ -351,7 +383,7 @@ mod tests {
 
         let summary = report.summary();
         assert!(
-            summary.contains("Uncovered sites:\n  src/lib.rs:11 CompoundAssignment `+=`\n  src/lib.rs:11 Arithmetic `*`\n"),
+            summary.contains("Uncovered sites:\n  src/lib.rs:11 CompoundAssignment `+=` → `-=`\n  src/lib.rs:11 Arithmetic `*` → `/`\n"),
             "{summary}",
         );
     }
@@ -365,7 +397,7 @@ mod tests {
         assert!(
             report
                 .summary()
-                .contains("Survived mutants:\n  src/lib.rs:7 Comparison `>`\n"),
+                .contains("Survived mutants:\n  src/lib.rs:7 Comparison `>` → `>=`\n"),
             "{}",
             report.summary(),
         );
@@ -394,14 +426,14 @@ mod tests {
 
         assert_eq!(
             report.summary(),
-            "Killed:    3 (2 test-failure, 0 arithmetic-panic, 1 timeout)\n\
+            "Killed:    3 (2 test-failure, 0 arithmetic-panic, 0 compile-error, 1 timeout)\n\
              Survived:  1\n\
              Uncovered: 1\n\
              Score:     75.0% (3 killed of 4 mutants run; 1 uncovered site excluded)\n\
              Survived mutants:\n  \
-             src/lib.rs:5 Arithmetic `/`\n\
+             src/lib.rs:5 Arithmetic `/` → `*`\n\
              Uncovered sites:\n  \
-             src/lib.rs:6 Constant `1`\n",
+             src/lib.rs:6 Constant `1` → `0`\n",
         );
     }
 
@@ -450,7 +482,7 @@ mod tests {
     fn summary_reports_no_score_when_nothing_ran() {
         assert_eq!(
             MutationReport::new(FILE).summary(),
-            "Killed:    0 (0 test-failure, 0 arithmetic-panic, 0 timeout)\n\
+            "Killed:    0 (0 test-failure, 0 arithmetic-panic, 0 compile-error, 0 timeout)\n\
              Survived:  0\n\
              Uncovered: 0\n\
              Score:     n/a (no mutants were run)\n",

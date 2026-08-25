@@ -25,6 +25,19 @@
 //! | Bitwise | `& → \|`; `\| → &`; `^ → &` | idiomatic (S6) |
 //! | Shift | `<< → >>`; `>> → <<` | idiomatic (S6) |
 //! | Predicate method | `is_some → is_none`; `is_none → is_some`; `is_ok → is_err`; `is_err → is_ok` | idiomatic (S6) |
+//! | `Option`/`Result` | `Some(x) → None`; `Ok → Err` | idiomatic (S6) |
+//! | `unwrap` | `unwrap → unwrap_or_default` | idiomatic (S6) |
+//! | `?` operator | `? → .unwrap()` | idiomatic (S6) |
+//! | `match`-arm guard | `if <guard> → ` (dropped) | idiomatic (S6) |
+//!
+//! The structural S6 rows are token-**independent**: each is one span the
+//! scanner chose so that a single replacement suffices — the whole `Some(x)`
+//! call, the `Ok` identifier alone (so the bound value survives), the `unwrap`
+//! method identifier, the `?` token, and the arm's `if <guard>`. Their
+//! preconditions (`T: Default`, a compatible error type, a permitting `Try`
+//! type) are **undecidable without type information**, so unlike the float rows
+//! they cannot be precondition-gated at emission; a mutant that does not compile
+//! is scored `Killed` with [`crate::outcome::KillReason::CompileError`] (A8/R4).
 //!
 //! The three parity arithmetic mappings are **byte-identical to mutate4go** and
 //! must stay that way: S4/S6 only *add* the operators upstream never mutated. The
@@ -134,6 +147,13 @@ pub(crate) fn replacement(operator: Operator, token: &str) -> Result<String> {
         Operator::IsNone => "is_some",
         Operator::IsOk => "is_err",
         Operator::IsErr => "is_ok",
+        Operator::SomeCall => "None",
+        Operator::OkCall => "Err",
+        Operator::Unwrap => "unwrap_or_default",
+        Operator::Try => ".unwrap()",
+        // The span covers `if <guard>`; dropping it leaves the arm's pattern and
+        // body untouched.
+        Operator::ArmGuard => "",
         Operator::Zero => return mutate_int_literal(token, 0, '1'),
         Operator::One => return mutate_int_literal(token, 1, '0'),
         Operator::FloatZero => return mutate_float_literal(token, 0, "1.0"),
@@ -495,17 +515,92 @@ mod tests {
         assert!(replacement(Operator::Zero, "0x10u8").is_err());
     }
 
+    #[test]
+    fn structural_mappings_are_token_independent() {
+        // Each is one span the scanner chose so a single replacement suffices;
+        // the token is whatever the author wrote there and is not consulted.
+        assert_eq!(map(Operator::SomeCall, "Some(x)"), "None");
+        assert_eq!(map(Operator::OkCall, "Ok"), "Err");
+        assert_eq!(map(Operator::Unwrap, "unwrap"), "unwrap_or_default");
+        assert_eq!(map(Operator::Try, "?"), ".unwrap()");
+        assert_eq!(map(Operator::ArmGuard, "if x > 2"), "");
+    }
+
     /// Mutating an in-scope site always changes the token — a mapping that
     /// returned the original would produce an equivalent (never-killable) mutant.
     ///
     /// Driven by [`Operator::ALL`] and [`Operator::canonical_token`], so a new
     /// operator is covered **by construction**: `ALL` is generated from the same
-    /// variant list as the enum, so a variant cannot exist outside it.
+    /// variant list as the enum, so a variant cannot exist outside it. Structural
+    /// operators have no canonical token; the equivalent property for them is the
+    /// scanner's composition test, which asserts the exact mutant source.
     #[test]
     fn every_mapping_changes_the_token() {
         for operator in Operator::ALL {
-            let token = operator.canonical_token();
+            let Some(token) = operator.canonical_token() else {
+                continue;
+            };
             assert_ne!(map(operator, token), token, "{operator:?} is a no-op");
+        }
+    }
+
+    /// The exact description a **token-less** structural operator must render,
+    /// or `None` for an operator that has a canonical token (whose description is
+    /// *derived* from the mapping below instead of pinned).
+    ///
+    /// A structural operator's replacement is not a function of any token, so
+    /// there is no string to derive and the honest form is an exact table. The
+    /// split is checked against [`Operator::canonical_token`] over the whole
+    /// [`Operator::ALL`] roster, so a new token-less operator with no row here
+    /// fails loudly rather than going unchecked — the `declare_operators!`
+    /// standard applied to a test table.
+    fn structural_description(operator: Operator) -> Option<&'static str> {
+        match operator {
+            Operator::SomeCall => Some("`Some(_)` → `None`"),
+            Operator::OkCall => Some("`Ok(_)` → `Err(_)`"),
+            Operator::ArmGuard => Some("`if <guard>` → dropped"),
+            _ => None,
+        }
+    }
+
+    /// The record's rendering and the mapping cannot drift: for every operator
+    /// with a canonical token, the description is exactly that token and what it
+    /// maps to; for the structural operators, which have no token, it is the
+    /// exact pinned string above — a containment check would accept an arbitrary
+    /// left-hand side, so `Ok(_) → Err(_)` could silently become `Err(_) →
+    /// Err(_)`, a self-contradictory no-op in the survivor listing.
+    ///
+    /// The pinned string is additionally checked to mention what is actually
+    /// spliced, so the table cannot drift away from [`replacement`] either.
+    #[test]
+    fn description_matches_the_mapping() {
+        for operator in Operator::ALL {
+            match (operator.canonical_token(), structural_description(operator)) {
+                (Some(token), None) => assert_eq!(
+                    operator.description(),
+                    format!("`{token}` → `{}`", map(operator, token)),
+                    "{operator:?}",
+                ),
+                (None, Some(pinned)) => {
+                    assert_eq!(operator.description(), pinned, "{operator:?}");
+                    let spliced = map(operator, "");
+                    if spliced.is_empty() {
+                        assert!(
+                            pinned.contains("dropped"),
+                            "{operator:?} splices nothing but does not say so",
+                        );
+                    } else {
+                        assert!(
+                            pinned.contains(&spliced),
+                            "{operator:?} describes a replacement it does not splice",
+                        );
+                    }
+                }
+                (Some(_), Some(_)) | (None, None) => panic!(
+                    "{operator:?} must have exactly one of a canonical token or a pinned \
+                     structural description",
+                ),
+            }
         }
     }
 }
