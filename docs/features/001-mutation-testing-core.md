@@ -94,7 +94,7 @@ One or more tasks per slice.
 | T9  | S3 | Universal + arithmetic-parity operators (see taxonomy) + result reporter (Killed/Survived/Uncovered). | Done ✅ | 54d30e2 |
 | T10 | S4 | Arithmetic idiomatic completions: `/→*`, `%→*`, compound-assignment ops. | Done ✅ | 04b15fd |
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map; **add `llvm-tools-preview` + `cargo-llvm-cov` to both CI legs**; **verify A6 `--reuse-coverage`-without-coverage against upstream**. | Done | `a89ae64` |
-| T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Pending | - |
+| T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Done | `TBD` |
 | T13 | S6 | Rust-specific operators: `Option`/`Result`, `match`-arm, `unwrap`/`expect`, `?`, bitwise, **float constants (`0.0↔1.0`)**; precondition-gated emission (A8-adjacent). | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
 | T15 | S7 | `--since-last-run`, `--mutate-all`, `--lines`; post-run manifest update; wire changed-count into `--scan`. | Pending | - |
@@ -724,6 +724,211 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     tautology. Fixture reduction is honest and documented (region tuples verbatim; only unconsumed bulk
     stripped). `pipeline.rs` left untouched is the right call — nothing consumes the map yet, and a
     speculative wiring would have been the premature move.
+
+- **T12 — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S5 CLOSED — clear to proceed to S6/T13.** The
+  slice's five stated outcomes all land (covered-only execution; uncovered reported-and-skipped;
+  `--reuse-coverage` incl. the verbatim upstream notice; A6 coverage-absent parity; `cargo-llvm-cov`
+  wired end-to-end), and **all four T11-close human decisions are discharged in the same commit**:
+  `#[cfg(test)]` skipped at discovery, `taiki-e/install-action` pinned to
+  `b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7`, `coverage`/`coverage_map` and their items
+  tightened to `pub(crate)`, `#![forbid(unsafe_code)]` added. Nothing is owed for S5.
+  - **The record model is right, and it is right for the right reason.** `MutationReport` stores
+    `file` + `Vec<MutantRecord>` and *nothing else* — every counter is an `iter().filter().count()`,
+    so there is no parallel tally that could drift, and `the_counters_sum_to_the_record_count` pins
+    the partition rather than a hand-computed number. `MutantResult::Killed(KillReason)` with
+    `bucket()` folding all three reasons into `Killed` is the exactly-correct expression of A8: the
+    record gains fidelity, the bucket set is provably unchanged
+    (`every_kill_reason_folds_into_the_killed_bucket` iterates all reasons). D6 now has the
+    instrumentation it was deferred pending. **A3 single-file → file-on-report, not per-record** is
+    the right normalization and the one that will make D4's JSON smallest.
+  - **Arithmetic-panic detection by rustc's three specific messages is the only defensible rule** —
+    a generic `"panicked"` detector would match every `assert!` and destroy the R3 signal.
+    `an_assertion_panic_is_not_an_arithmetic_panic` is the test that makes it honest. Accepted risk,
+    correctly bounded: the markers are rustc message strings and can drift across toolchains; drift
+    degrades an `ArithmeticPanic` into a `TestFailure` — a **fidelity** loss inside the correct
+    bucket, never a bucket error. That is the safe failure direction; no action.
+  - **`macro_rules! declare_operators` — endorsed, and the right fix for the class of bug found.**
+    The round-1 FAIL was real: a hand-kept `ALL` makes "the guardrail is complete" an unenforced
+    convention. Generating the enum and the roster from one variant list makes the omission
+    *inexpressible* rather than merely tested-for, which is the stronger construction. This is the
+    repo's second instance of the same principle (derive-don't-store, after `Site.kind`) and it should
+    be treated as the house idiom.
+    - **Q5 ruling — yes, size-pinning is the correct residual assertion.** Membership and order are
+      guaranteed by construction, so asserting them would be a tautology over the macro. What
+      construction *cannot* guarantee is that a roster change was deliberate; `Operator::ALL.len() == 22`
+      is precisely the residue. Expect to bump it at T13 — that is the test working, not failing.
+  - **`Site.kind` → method, `canonical_token()`, `OsString` unification, region-`kind` documentation,
+    the export `type`/`version`-major drift guard, the `reuse`/`load` success-path tests** — every T11
+    carry-forward landed as written. The drift guard in particular closes the one-notch-weak finding:
+    the fixture's doc comment claimed 3.1.0 and now the code asserts it.
+  - **`ensure_not_empty` — the right backstop, and the reuse-path exemption is the right nuance.** An
+    empty map after a *successful* generation is far more often a path mismatch than an untested file,
+    and the message names the target, the profile, "usually a path mismatch", and every filename the
+    export contained — that is diagnosable at a glance rather than a bare failure. Deliberately not
+    applying it under `--reuse-coverage` is correct: a stale profile may legitimately omit the file,
+    and the reuse notice already warns. `fs::canonicalize`-preferred with normalise-then-suffix
+    fallback, memoised per distinct filename, closes the Windows-casing hole precisely rather than by
+    blanket case-folding. Item 9 of the T11 review is fully discharged.
+  - **`#[cfg(test)]` divergence — correct, correctly documented, correctly bounded, but not applied
+    uniformly.** The literal-only match (`cfg(test)` exactly; `cfg(any(test, …))` still scanned) is
+    the right conservatism — a composite predicate compiles outside test builds, so treating it as
+    test-only would silently drop production sites — and
+    `a_composite_cfg_predicate_is_still_scanned` pins it. The control-vs-attribute pairing in
+    `sites_inside_a_cfg_test_module_are_not_discovered` (identical body scanned without the
+    attribute) is the right proof shape: it shows the *attribute* suppresses discovery, not the
+    nesting.
+    - **Gap worth closing at T13 (not a blocker):** `is_cfg_test` is checked in `visit_item_fn`,
+      `visit_impl_item_fn`, `visit_item_impl`, `visit_item_mod` — but **not** in `visit_item_trait`
+      or `visit_trait_item_fn`, and not for module-level `#[cfg(test)] const`/`static` (whose
+      literals still reach `visit_lit_int`). Low-frequency, but the shape of the omission is the
+      concern: a per-visitor gate is a hand-kept list, and hand-kept lists are exactly what
+      `declare_operators` was just introduced to abolish. **Preferred fix at T13:** gate **once** in
+      `visit_item` via an exhaustive `item_attrs(&syn::Item) -> &[Attribute]` match — a new `syn::Item`
+      variant then becomes a compile error instead of a silent hole, and the six per-visitor checks
+      collapse to one. Same principle, applied to the scanner.
+  - **Q1 ruling — the summary contract is right; the format has one misread risk.** "Change-detector,
+    not a stability contract pre-1.0" is the correct call and consistent with the identical rulings at
+    T6 (`--scan`) and T9. **D4 must serialize records and must never re-parse `summary()` — endorsed
+    without reservation**; that is the whole reason records-as-model was mandated. On the format
+    itself:
+    - Always printing all three kill reasons (including zeros) — **keep**; greppable and
+      shape-stable.
+    - `Score: 100.0%` on a run that mutated 1 of 2 sites is the one line a human will misread as
+      "this file is well tested". The number is correct per design.md (uncovered excluded, reported
+      separately) but it is presented without its denominator. **Suggest** qualifying the line
+      (e.g. `Score:     100.0% (1 of 1 mutants run; 1 site uncovered, excluded)`) — cheap, and it
+      makes the exclusion impossible to miss. **→ human's call on wording.**
+    - `records()` returns insertion order, which is *uncovered-first-then-mutated*, not source
+      order. Within each listing the order is source order (partition is stable), so the human-facing
+      output is fine — but D4 should sort by line at serialization rather than inherit an artifact
+      of the loop.
+  - **Q2 ruling — split the two.** `MutationReport::records()` is a legitimate accessor on the model
+    that D4 will need; `#[cfg(test)]` on it today is the honest way to satisfy `-D warnings`, and
+    un-gating is a one-line change at its first production caller. Keep it. `parse_export` is a
+    different animal: it is a *test-scaffolding wrapper* (`map_for(&parse_document(json)?, target)`)
+    living in the production namespace with no production role. **Move it into `mod tests`** — same
+    two lines, zero production surface, and the module then contains only code the product runs.
+    Non-blocking; fold into T13.
+  - **Q3 — `report.killed_by` `pub(crate)` is correct.** It has a real production caller (`summary`)
+    and no external one. No finding.
+  - **Q4 — accepted, but the waste is avoidable without touching R1 ordering.** Coverage must stay
+    ahead of `RestoreGuard` (a coverage pass over mutated source classifies the wrong program), and
+    that is not negotiable. But an unparseable target can be rejected by a **millisecond
+    `syn::parse_file` pre-flight on the target's bytes before the coverage run**, discarding the
+    result. That is a *validation*, not a stage, so it reorders nothing and costs nothing — it just
+    stops a ~30 s instrumented build being spent to learn the file has a syntax error. **Suggest for
+    T13**, where the scanner is already being touched.
+  - **Q — the `Selection`/`select_sites` composition point: shape is right, arity is not, and T15
+    will feel it.** Landing **one** line-keyed filtering point between `scan_source` and the loop was
+    the correct T11 mandate and it is correctly discharged; borrowing the scan (`Vec<&Site>`) rather
+    than cloning is right; `site.line` as the whole coverage key keeps multi-site lines consistent.
+    But the current two-way partition encodes an assumption that **every site is either mutated or
+    Uncovered**, and that is exactly what `--lines` (T15) and differential selection (T14) break:
+    - a covered site **outside `--lines`** is *not uncovered*. Recording it as `Uncovered` would be a
+      false statement about the test suite and would corrupt the one bucket S5 exists to produce.
+    - `MutantOutcome` must **not** grow a fourth bucket to absorb it — that would break A8/parity.
+    - **Ruling: filters narrow, gating classifies.** `--lines` and differential selection are
+      *site-list narrowing* applied **first**; a narrowed-out site produces **no record at all**.
+      Coverage gating then partitions only what survived narrowing, exactly as today. Concretely,
+      `Selection` gains a third, *unrecorded* list (or `select_sites` takes a
+      `filter: impl Fn(&Site) -> bool` applied before the partition), and the summary may report a
+      narrowing count as a non-bucket line (`Sites skipped by --lines: N`). This is a ~15-line change
+      at T15, not a redesign — **provided T13/T15 do not first start recording narrowed-out sites as
+      Uncovered.** Land the three-way shape at the moment the second filter arrives, not before
+      (YAGNI), but do not let the binary partition harden into an assumption.
+    - **Owed verification at T15 (do not guess):** does upstream mutate4go apply `--lines` before or
+      after coverage gating, and does it report line-excluded sites at all? Same discipline as the A6
+      resolution — check the source, record what it does.
+  - **Q — the stderr drain: dropping (not joining) on timeout is the right call, and it sharpens
+    T17's owed work rather than duplicating it.** Joining would re-introduce precisely the hang the
+    timeout exists to escape, because a hung *grandchild* still holds the pipe's write end open —
+    the reasoning in the doc comment is correct and the flood test proves the concurrent drain
+    prevents the pipe-full deadlock being misreported as a timeout. Two consequences to carry:
+    1. **Dropping the `JoinHandle` does not close the read end** — the detached thread owns the pipe
+       and stays blocked in `read_to_end` on an unbounded `Vec`. So each timeout leaks one thread
+       *and* an unbounded buffer, and the still-open read end means the hung grandchild never gets a
+       broken pipe to stop it. This is the **same root cause** as the known Windows
+       orphan-grandchild problem owed to T17: a real process-group (Unix) / job-object (Windows)
+       kill closes the write end, the reader hits EOF, the thread exits and the buffer frees. **T17's
+       process-tree kill therefore also retires this leak** — record it as a second reason that item
+       is owed, not merely a nicety.
+    2. **Independent of T17, bound the buffer.** `pipe.take(CAP).read_to_end(..)` with a generous cap
+       (~8–16 MiB; the flood test captures 512 KiB, so no test moves) makes memory bounded on *every*
+       path, including the success path where a mutant that loops printing to stderr for 299 s can
+       balloon. Two-line change; **suggest for T17** alongside the tree-kill.
+    - Discarding stderr entirely on the timeout path is correct — `classify` gives `Timeout` absolute
+      precedence over any stderr content, so nothing is lost.
+  - **`tests/e2e.rs` — the right test, correctly scoped, and it finally earns the CI install.** One
+    real fixture-crate run proving discover → coverage → mutate → test → report compose (Killed 1 /
+    Survived 0 / Uncovered 1, uncovered listed by location, target pristine afterwards, both the
+    generate and the reuse path), plus a sub-second exit-code assertion that compiles nothing. Golden
+    rule #8 respected — one heavy test, not a suite. The **env scrub** is the load-bearing detail and
+    is correct: without removing `RUSTFLAGS`/`CARGO_TARGET_DIR`/`LLVM_PROFILE_FILE`/`CARGO_LLVM_COV*`
+    the nested instrumented build would inherit the outer `cargo llvm-cov` context and either reuse
+    the wrong target dir or refuse to instrument — a failure that would have looked like a product
+    bug. Counting uncovered *entries* rather than grepping a line number, because the mutant's own
+    `cargo test` output is inherited into stdout, is the honest workaround.
+    - The workaround points at a **real UX defect owed to T17**: the runner inherits child **stdout**,
+      so a default run floods the terminal with one full `cargo test` transcript per mutant, and the
+      report is buried at the end. **T17 must suppress mutant stdout by default and surface it under
+      `--verbose`** — the flag is already reserved for exactly this, and it makes the report readable.
+      (Keep the baseline's stderr capture as-is; it is what makes the red-baseline abort
+      diagnosable.)
+  - **Minor, non-blocking:** `mutate_with_coverage` runs `check_baseline` even when
+    `selection.mutate` is empty — a full non-instrumented compile spent to validate a run with zero
+    mutants. Pinned by `every_site_is_uncovered_when_the_map_is_empty_but_the_baseline_still_runs`,
+    so it is deliberate. Defensible today (T17 will want the baseline *measurement* regardless), but
+    once `--lines` can narrow to zero it becomes a visible waste — revisit at T17 when the baseline
+    gains its timing role.
+  - **Carry-forwards to T13–T17**
+    - **T13 (highest priority) — the record's rendering assumes one-token operators.**
+      `MutantRecord::render` prints `Operator::canonical_token()`, and `canonical_token` is defined as
+      "the operator's own source token". S6's structural operators (`Some(x) → None`,
+      `expr? → expr.unwrap()`, arm-body swap) **have no canonical token**, and the T4 carry-forward
+      already predicted the single-span/single-`Operator` `Site` will not fit them. When the model
+      generalizes, the record must carry a **description of the mutation** (or the original and
+      replacement slices), not a token — and `canonical_token` should narrow to what it truly is: the
+      guardrail/round-trip primitive for single-token operators. Decide this *with* the `Vec<Edit>`
+      change, not after; retrofitting the record shape twice is the avoidable cost.
+    - **T13 — gate `#[cfg(test)]` once in `visit_item`** (above), and bump
+      `all_holds_the_declared_operator_roster` deliberately.
+    - **T13 — move `parse_export` into `mod tests`**; pre-flight-parse the target before the coverage
+      run (Q4).
+    - **T14/T15 — `Selection` becomes three-way** (narrow → then gate), with narrowed-out sites
+      producing **no record**; no fourth bucket. Verify `--lines`×coverage precedence against upstream.
+    - **T15 — records will want `function_id`.** They deliberately carry only `line`; differential
+      reporting ("which functions still have survivors") needs the function. Cheap to add then; noted
+      so it is not rediscovered as a defect.
+    - **T16 — unchanged and still correct:** both `RestoreGuard`'s target and `crate_root` must point
+      at the worker's isolated copy; `crate_root_of` still resolves against canonical source. Add:
+      **coverage generation must not be run per-worker** — one pre-run coverage pass feeds all workers,
+      or N instrumented builds will dwarf the mutation cost.
+    - **T17 — process-group / job-object kill is now owed for two reasons** (orphan grandchild holding
+      the `target/` build lock **and** the leaked unbounded drain thread); bound the stderr buffer;
+      suppress mutant stdout unless `--verbose`; `check_baseline` returns the measured `Duration` and
+      `timeout = baseline × --timeout-factor` (default 10), retiring `DEFAULT_MUTANT_TIMEOUT`; wire
+      `--test-command`, `--mutation-warning` (and rule on the parity-inherited default 50 against a
+      non-parity site count — now *reduced* by the `#[cfg(test)]` skip, which cuts the other way and
+      should be re-measured after S6).
+    - **S8 visibility sweep — unchanged scope:** `apply`, `runner`, `scanner`, `site`, `manifest`,
+      `outcome` remain accidentally `pub`. T12 correctly tightened only what it gave callers to.
+  - **Nothing in T12 compromises the architecture if carried forward.** Core stayed pure (`site`,
+    `scanner`, `operators`, `outcome`, `coverage_map` import no fs/process/clap; the macro is a
+    declaration-site device, not a dependency); the only outward edge is the already-sanctioned
+    `pipeline → apply`/`runner`/`coverage`; seams still take domain primitives and `RunConfig`
+    correctly still does not exist — **T15 is the slice that finally justifies it** (`--lines`,
+    `--since-last-run`, `--mutate-all` arriving together), and it should be introduced there rather
+    than retrofitted out of `&Cli` coupling.
+
+### ⚠ Product decisions owed to the human (raised at T12 close / S5 close)
+1. **Score-line qualifier.** Does `Score: 100.0%` carry its denominator and the uncovered exclusion
+   inline (e.g. `100.0% (1 of 1 mutants run; 1 site uncovered, excluded)`), or stay bare? The bare
+   form is correct per design.md but invites a "fully tested" misread on a partially-covered file.
+2. **Mutant stdout under `--verbose` (T17).** Confirm that suppressing per-mutant `cargo test` output
+   by default is wanted — it is a UX divergence from today's inherit-everything behaviour, and it
+   changes what a CI log looks like.
+3. **`--lines` × coverage precedence (T15).** Confirm Anders' ruling — line-excluded sites are
+   **not reported at all** (not `Uncovered`, no fourth bucket) — pending the upstream check.
 
 ### A6 — upstream verification (discharged at T11, recorded verbatim)
 Verified against `unclebob/mutate4go` `internal/runner/runner.go`:

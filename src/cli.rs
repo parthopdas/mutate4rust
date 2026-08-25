@@ -373,6 +373,7 @@ impl Cli {
             &crate_root,
             &runner::default_command(),
             pipeline::DEFAULT_MUTANT_TIMEOUT,
+            self.reuse_coverage,
         )
     }
 }

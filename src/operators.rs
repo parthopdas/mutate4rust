@@ -274,32 +274,14 @@ mod tests {
 
     /// Mutating an in-scope site always changes the token — a mapping that
     /// returned the original would produce an equivalent (never-killable) mutant.
+    ///
+    /// Driven by [`Operator::ALL`] and [`Operator::canonical_token`], so a new
+    /// operator is covered **by construction**: `ALL` is generated from the same
+    /// variant list as the enum, so a variant cannot exist outside it.
     #[test]
     fn every_mapping_changes_the_token() {
-        for (operator, token) in [
-            (Operator::Add, "+"),
-            (Operator::Sub, "-"),
-            (Operator::Mul, "*"),
-            (Operator::Div, "/"),
-            (Operator::Rem, "%"),
-            (Operator::Greater, ">"),
-            (Operator::GreaterEqual, ">="),
-            (Operator::Less, "<"),
-            (Operator::LessEqual, "<="),
-            (Operator::Equal, "=="),
-            (Operator::NotEqual, "!="),
-            (Operator::And, "&&"),
-            (Operator::Or, "||"),
-            (Operator::True, "true"),
-            (Operator::False, "false"),
-            (Operator::Zero, "0"),
-            (Operator::One, "1"),
-            (Operator::AddAssign, "+="),
-            (Operator::SubAssign, "-="),
-            (Operator::MulAssign, "*="),
-            (Operator::DivAssign, "/="),
-            (Operator::RemAssign, "%="),
-        ] {
+        for operator in Operator::ALL {
+            let token = operator.canonical_token();
             assert_ne!(map(operator, token), token, "{operator:?} is a no-op");
         }
     }

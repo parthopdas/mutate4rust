@@ -1,10 +1,21 @@
-//! The mutate loop (Application layer): baseline check → per-site
-//! apply/test/classify/restore → report.
+//! The mutate loop (Application layer): coverage → baseline check → per-covered-
+//! site apply/test/classify/restore → report.
 //!
 //! This module orchestrates the existing seams without fusing them — [`splice`]
 //! stays pure, [`RestoreGuard`] owns the fs round-trip, and [`TestRunner`] owns
 //! the subprocess. It takes **domain primitives** (`&Path`, `&[String]`,
-//! [`Duration`]), never the clap `Cli`.
+//! [`Duration`], `bool`), never the clap `Cli`.
+//!
+//! # Stage order is load-bearing (R1)
+//!
+//! Coverage is resolved **first, against pristine source, before
+//! [`RestoreGuard`] takes its in-memory copy** — a coverage pass over a mutated
+//! file would classify the wrong program. The baseline check then runs on a
+//! *non*-instrumented build, because that is the measurement T17 derives the
+//! per-mutant timeout from and a green `cargo llvm-cov` run is not a substitute.
+//! The cost is acknowledged, not eliminated: `cargo-llvm-cov` builds instrumented
+//! into its own target directory, so a default run pays **two** full compiles
+//! before mutant #1. `--reuse-coverage` is the user's lever.
 //!
 //! # Two distinct caller-owned paths
 //!
@@ -27,8 +38,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::apply::{RestoreGuard, splice};
+use crate::coverage;
+use crate::coverage_map::CoverageMap;
 use crate::operators;
-use crate::report::MutationReport;
+use crate::outcome::MutantResult;
+use crate::report::{MutantRecord, MutationReport};
 use crate::runner::TestRunner;
 use crate::scanner;
 use crate::site::Site;
@@ -38,32 +52,92 @@ use crate::site::Site;
 /// silently inflate the score.
 pub(crate) const DEFAULT_MUTANT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Runs the full single-file mutate loop and returns the bucket tallies.
+/// The sites of one scan, split by whether they will be mutated.
+///
+/// Borrowed from the caller's scan so nothing is cloned.
+struct Selection<'a> {
+    /// Sites that will be mutated and tested.
+    mutate: Vec<&'a Site>,
+    /// Sites reported as [`MutantResult::Uncovered`] — listed, never executed.
+    uncovered: Vec<&'a Site>,
+}
+
+/// The **single** line-keyed site-filtering point, applied between
+/// [`scanner::scan_source`] and the mutate loop.
+///
+/// Covered-only gating (T12) and `--lines` (T15) are both predicates over a
+/// site's `line`, so T15 extends *this* function rather than adding a second,
+/// independently-ordered filter. `site.line` is the whole coverage key, so every
+/// site on a line resolves identically.
+fn select_sites<'a>(sites: &'a [Site], coverage: &CoverageMap) -> Selection<'a> {
+    let (mutate, uncovered) = sites
+        .iter()
+        .partition(|site| coverage.is_line_covered(site.line));
+    Selection { mutate, uncovered }
+}
+
+/// Runs the full single-file mutate loop and returns the per-mutant records.
+///
+/// Resolves coverage first — regenerating it, or reusing an existing profile when
+/// `reuse_coverage` is set (A6) — then delegates to [`mutate_with_coverage`].
 ///
 /// # Errors
 ///
-/// Returns an error if the target cannot be read or parsed, if the **baseline**
-/// test suite is not green (see [`check_baseline`]), or if applying/restoring a
-/// mutant fails.
+/// Returns an error if coverage cannot be produced or reused, if the target
+/// cannot be read or parsed, if the **baseline** test suite is not green (see
+/// [`check_baseline`]), or if applying/restoring a mutant fails.
 pub(crate) fn run(
     target: &Path,
     crate_root: &Path,
     command: &[String],
     timeout: Duration,
+    reuse_coverage: bool,
+) -> Result<MutationReport> {
+    let coverage = if reuse_coverage {
+        coverage::reuse(crate_root, target)?
+    } else {
+        coverage::generate(crate_root, target)?
+    };
+
+    mutate_with_coverage(target, crate_root, command, timeout, &coverage)
+}
+
+/// The mutate loop against an already-resolved coverage map.
+///
+/// Split from [`run`] so the loop is testable against a hand-built map, without
+/// spawning a real coverage pass.
+///
+/// # Errors
+///
+/// See [`run`].
+fn mutate_with_coverage(
+    target: &Path,
+    crate_root: &Path,
+    command: &[String],
+    timeout: Duration,
+    coverage: &CoverageMap,
 ) -> Result<MutationReport> {
     let guard = RestoreGuard::new(target)?;
     let sites = scanner::scan_source(guard.original())?;
+    let selection = select_sites(&sites, coverage);
     let runner = TestRunner::new(command, timeout, crate_root);
 
+    let mut report = MutationReport::new(&target.display().to_string());
+    for site in &selection.uncovered {
+        report.record(MutantRecord::new(site, MutantResult::Uncovered));
+    }
+
     check_baseline(&runner)?;
-    mutate_sites(&guard, &sites, &runner)
+    mutate_sites(&guard, &selection.mutate, &runner, &mut report)?;
+    Ok(report)
 }
 
 /// Confirms the suite is green **before** any mutation.
 ///
 /// The runner classifies a mutant purely by the test command's exit status, so an
 /// already-red (or already-hanging) baseline would make every single mutant look
-/// Killed. That is a misclassified run, not a useful one — abort instead.
+/// Killed. That is a misclassified run, not a useful one — abort instead, quoting
+/// the suite's own stderr so the abort is diagnosable.
 ///
 /// # Errors
 ///
@@ -78,14 +152,15 @@ fn check_baseline(runner: &TestRunner) -> Result<()> {
     if !baseline.tests_passed {
         bail!(
             "baseline test suite is not green; fix the failing tests before mutating \
-             (every mutant would otherwise be misclassified as killed)"
+             (every mutant would otherwise be misclassified as killed)\n{}",
+            baseline.stderr.trim_end(),
         );
     }
     Ok(())
 }
 
-/// Applies each site in turn, runs the suite, classifies the mutant, and restores
-/// the original bytes — once per iteration, including on the error path.
+/// Applies each selected site in turn, runs the suite, records the mutant, and
+/// restores the original bytes — once per iteration, including on the error path.
 ///
 /// # Errors
 ///
@@ -93,11 +168,10 @@ fn check_baseline(runner: &TestRunner) -> Result<()> {
 /// be written or restored, or if the test command fails to run.
 fn mutate_sites(
     guard: &RestoreGuard,
-    sites: &[Site],
+    sites: &[&Site],
     runner: &TestRunner,
-) -> Result<MutationReport> {
-    let mut report = MutationReport::default();
-
+    report: &mut MutationReport,
+) -> Result<()> {
     for site in sites {
         // Everything up to `write_mutant` leaves the file pristine, so an early
         // `?` here needs no restore (and `Drop` is the backstop regardless).
@@ -114,28 +188,51 @@ fn mutate_sites(
         let mutated = splice(guard.original(), &site.byte_span, &replacement)?;
 
         guard.write_mutant(&mutated)?;
-        let outcome = runner.run_and_classify();
+        let result = runner.run_and_classify();
         // Restore before propagating a run error, so no iteration can exit with a
         // mutant left on disk.
         guard.restore()?;
-        report.record(outcome?);
+        report.record(MutantRecord::new(site, result?));
     }
 
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check_baseline, mutate_sites, run};
+    use super::{check_baseline, mutate_sites, mutate_with_coverage, select_sites};
     use crate::apply::RestoreGuard;
+    use crate::coverage_map::{CoverageMap, Region};
+    use crate::outcome::{KillReason, MutantOutcome, MutantResult};
+    use crate::report::MutationReport;
     use crate::runner::TestRunner;
     use crate::scanner;
+    use crate::site::Operator;
     use std::path::Path;
     use std::time::Duration;
 
     /// A source with exactly two in-scope sites, one per function.
     const TWO_SITE_SOURCE: &str = "fn f(a: i32, b: i32) -> i32 { a + b }\n\
                                    fn g(c: i32, d: i32) -> i32 { c - d }\n";
+
+    /// Coverage marking every line of a file covered, so a test that is not about
+    /// gating behaves exactly as the pre-S5 loop did.
+    fn everything_covered() -> CoverageMap {
+        CoverageMap::new(vec![Region {
+            start_line: 1,
+            end_line: usize::MAX,
+            count: 1,
+        }])
+    }
+
+    /// Coverage marking only `line` covered.
+    fn only_line_covered(line: usize) -> CoverageMap {
+        CoverageMap::new(vec![Region {
+            start_line: line,
+            end_line: line,
+            count: 1,
+        }])
+    }
 
     /// A program name no test machine can resolve, so spawning it always fails.
     const MISSING_PROGRAM: &str = "mutate4rust-no-such-test-command";
@@ -214,9 +311,10 @@ mod tests {
         std::fs::set_permissions(path, perms).expect("clear read-only on target");
     }
 
-    /// Drives [`run`] against a **read-only** `target.rs`, so any attempt to write
-    /// a mutant fails loudly instead of silently succeeding-and-restoring, and
-    /// returns the resulting error plus whether the OS actually blocked writes.
+    /// Drives [`mutate_with_coverage`] against a **read-only** `target.rs`, so any
+    /// attempt to write a mutant fails loudly instead of silently
+    /// succeeding-and-restoring, and returns the resulting error plus whether the
+    /// OS actually blocked writes.
     fn run_with_unwritable_target(
         dir: &Path,
         command: &[String],
@@ -224,7 +322,8 @@ mod tests {
     ) -> (anyhow::Error, bool) {
         let target = dir.join("target.rs");
         let writes_blocked = make_read_only(&target);
-        let err = run(&target, dir, command, timeout).expect_err("the baseline must abort the run");
+        let err = mutate_with_coverage(&target, dir, command, timeout, &everything_covered())
+            .expect_err("the baseline must abort the run");
         clear_read_only(&target);
         (err, writes_blocked)
     }
@@ -258,11 +357,14 @@ mod tests {
     }
 
     /// Runs the loop over `target.rs` in `dir` and returns the report.
-    fn loop_over(dir: &Path, runner: &TestRunner) -> crate::report::MutationReport {
+    fn loop_over(dir: &Path, runner: &TestRunner) -> MutationReport {
         let target = dir.join("target.rs");
         let guard = RestoreGuard::new(&target).expect("read target");
         let sites = scanner::scan_source(guard.original()).expect("parse target");
-        mutate_sites(&guard, &sites, runner).expect("loop should succeed")
+        let selected: Vec<_> = sites.iter().collect();
+        let mut report = MutationReport::new("target.rs");
+        mutate_sites(&guard, &selected, runner, &mut report).expect("loop should succeed");
+        report
     }
 
     #[test]
@@ -270,9 +372,9 @@ mod tests {
         let (dir, runner) = seed(TWO_SITE_SOURCE, &shell("exit 0"));
         let report = loop_over(dir.path(), &runner);
 
-        assert_eq!(report.survived, 2);
-        assert_eq!(report.killed, 0);
-        assert_eq!(report.uncovered, 0, "coverage gating is S5, never S3");
+        assert_eq!(report.survived(), 2);
+        assert_eq!(report.killed(), 0);
+        assert_eq!(report.uncovered(), 0, "the loop never records uncovered");
     }
 
     #[test]
@@ -280,8 +382,8 @@ mod tests {
         let (dir, runner) = seed(TWO_SITE_SOURCE, &shell("exit 1"));
         let report = loop_over(dir.path(), &runner);
 
-        assert_eq!(report.killed, 2);
-        assert_eq!(report.survived, 0);
+        assert_eq!(report.killed(), 2);
+        assert_eq!(report.survived(), 0);
     }
 
     #[test]
@@ -316,7 +418,7 @@ mod tests {
         let report = loop_over(dir.path(), &runner);
 
         assert_eq!(report.score(), None);
-        assert_eq!(report.killed + report.survived + report.uncovered, 0);
+        assert_eq!(report.records().len(), 0);
     }
 
     #[test]
@@ -378,8 +480,15 @@ mod tests {
         let target = dir.path().join("target.rs");
         let guard = RestoreGuard::new(&target).expect("read target");
         let sites = scanner::scan_source(guard.original()).expect("parse target");
+        let mut report = MutationReport::new("target.rs");
 
-        let err = mutate_sites(&guard, &sites, &runner).expect_err("spawn failure must propagate");
+        let err = mutate_sites(
+            &guard,
+            &sites.iter().collect::<Vec<_>>(),
+            &runner,
+            &mut report,
+        )
+        .expect_err("spawn failure must propagate");
         assert!(
             err.to_string().contains("spawn"),
             "unhelpful message: {err}"
@@ -393,19 +502,20 @@ mod tests {
     }
 
     #[test]
-    fn run_reports_survivors_end_to_end() {
+    fn mutate_with_coverage_reports_survivors_end_to_end() {
         // Full composition (baseline + loop) against a stub test command: green
         // baseline, then every mutant survives.
         let (dir, _runner) = seed(TWO_SITE_SOURCE, &shell("exit 0"));
-        let report = run(
+        let report = mutate_with_coverage(
             &dir.path().join("target.rs"),
             dir.path(),
             &shell("exit 0"),
             Duration::from_secs(60),
+            &everything_covered(),
         )
         .expect("run should succeed");
 
-        assert_eq!(report.survived, 2);
+        assert_eq!(report.survived(), 2);
         assert_eq!(report.score(), Some(0.0));
     }
 
@@ -413,13 +523,164 @@ mod tests {
     fn an_unparseable_target_fails_fast() {
         let (dir, _runner) = seed("fn broken(", &shell("exit 0"));
         assert!(
-            run(
+            mutate_with_coverage(
                 &dir.path().join("target.rs"),
                 dir.path(),
                 &shell("exit 0"),
                 Duration::from_secs(60),
+                &everything_covered(),
             )
             .is_err()
+        );
+    }
+
+    // ---- covered-only gating (the single composition point) ----
+
+    #[test]
+    fn select_sites_partitions_on_line_coverage() {
+        let sites = scanner::scan_source(TWO_SITE_SOURCE).expect("parse");
+        assert_eq!(sites.len(), 2, "the fixture must have one site per line");
+
+        let selection = select_sites(&sites, &only_line_covered(1));
+
+        assert_eq!(selection.mutate.len(), 1);
+        assert_eq!(selection.mutate[0].line, 1);
+        assert_eq!(selection.mutate[0].operator, Operator::Add);
+        assert_eq!(selection.uncovered.len(), 1);
+        assert_eq!(selection.uncovered[0].line, 2);
+        assert_eq!(selection.uncovered[0].operator, Operator::Sub);
+    }
+
+    #[test]
+    fn select_sites_with_an_empty_map_mutates_nothing() {
+        let sites = scanner::scan_source(TWO_SITE_SOURCE).expect("parse");
+        let selection = select_sites(&sites, &CoverageMap::default());
+
+        assert!(selection.mutate.is_empty());
+        assert_eq!(selection.uncovered.len(), 2);
+    }
+
+    #[test]
+    fn an_uncovered_site_is_reported_and_never_executed() {
+        // Only line 1 is covered, so exactly ONE mutant may reach the test
+        // command. The command log counts invocations: 1 baseline + 1 mutant. A
+        // loop that ignored coverage would log three.
+        let (dir, _runner) = seed(TWO_SITE_SOURCE, &shell("exit 1"));
+        let report = mutate_with_coverage(
+            &dir.path().join("target.rs"),
+            dir.path(),
+            &log_target_then_exit(0),
+            Duration::from_secs(60),
+            &only_line_covered(1),
+        )
+        .expect("run should succeed");
+
+        assert_eq!(report.uncovered(), 1, "the line-2 site is uncovered");
+        assert_eq!(report.survived(), 1, "the line-1 site was mutated");
+        assert_eq!(report.killed(), 0);
+        assert_eq!(
+            report.score(),
+            Some(0.0),
+            "uncovered sites are outside the score denominator",
+        );
+
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).expect("read log");
+        assert_eq!(
+            log.matches("fn f").count(),
+            2,
+            "exactly one baseline plus one mutant run: {log}",
+        );
+        assert_eq!(
+            log.matches("c + d").count(),
+            0,
+            "the uncovered line-2 site must never have been written or tested: {log}",
+        );
+    }
+
+    #[test]
+    fn uncovered_sites_are_listed_by_location_not_merely_counted() {
+        let (dir, _runner) = seed(TWO_SITE_SOURCE, &shell("exit 0"));
+        let target = dir.path().join("target.rs");
+        let report = mutate_with_coverage(
+            &target,
+            dir.path(),
+            &shell("exit 0"),
+            Duration::from_secs(60),
+            &only_line_covered(1),
+        )
+        .expect("run should succeed");
+
+        let summary = report.summary();
+        let location = format!("{}:2", target.display());
+        let listed: Vec<&str> = summary
+            .lines()
+            .skip_while(|line| !line.starts_with("Uncovered sites:"))
+            .skip(1)
+            .take_while(|line| line.starts_with("  "))
+            .collect();
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "exactly one site is listed as uncovered:\n{summary}",
+        );
+        assert!(
+            listed[0].contains(&location),
+            "the uncovered site must be listed at {location}:\n{summary}",
+        );
+        assert!(
+            listed[0].contains("`-`"),
+            "and named by its token:\n{summary}",
+        );
+    }
+
+    #[test]
+    fn every_site_is_uncovered_when_the_map_is_empty_but_the_baseline_still_runs() {
+        // The empty-map *backstop* lives in `coverage` (it can only judge a real
+        // generation); the loop itself must still behave sanely, reporting each
+        // site rather than pretending the file had none.
+        let (dir, _runner) = seed(TWO_SITE_SOURCE, &shell("exit 0"));
+        let report = mutate_with_coverage(
+            &dir.path().join("target.rs"),
+            dir.path(),
+            &shell("exit 0"),
+            Duration::from_secs(60),
+            &CoverageMap::default(),
+        )
+        .expect("run should succeed");
+
+        assert_eq!(report.uncovered(), 2);
+        assert_eq!(report.records().len(), 2);
+        assert_eq!(report.score(), None, "no killed and no survived");
+    }
+
+    #[test]
+    fn a_panic_kill_is_recorded_distinctly_while_staying_in_the_killed_bucket() {
+        // An arithmetic panic is what a mutated `+` actually produces in the wild;
+        // the record must say so, while A8's three buckets stay intact.
+        let script = if cfg!(windows) {
+            "echo attempt to divide by zero 1>&2 & exit 101"
+        } else {
+            "echo 'attempt to divide by zero' >&2; exit 101"
+        };
+        let (dir, runner) = seed(TWO_SITE_SOURCE, &shell(script));
+        let report = loop_over(dir.path(), &runner);
+
+        assert_eq!(report.killed(), 2);
+        assert_eq!(report.killed_by(KillReason::ArithmeticPanic), 2);
+        assert_eq!(report.killed_by(KillReason::TestFailure), 0);
+        assert!(
+            report
+                .records()
+                .iter()
+                .all(|record| record.bucket() == MutantOutcome::Killed),
+            "A8: a panic-kill is still just Killed",
+        );
+        assert!(
+            report
+                .records()
+                .iter()
+                .all(|record| record.result == MutantResult::Killed(KillReason::ArithmeticPanic)),
         );
     }
 }

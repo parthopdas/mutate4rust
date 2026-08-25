@@ -1,20 +1,22 @@
 //! `mutate4rust` core library.
 //!
 //! This crate hosts the mutation-testing engine. The [`site`], [`scanner`],
-//! `operators`, [`outcome`], and [`coverage_map`] modules are the pure
+//! `operators`, [`outcome`], and `coverage_map` modules are the pure
 //! **Core/domain** layer (the mutation-site model, the `syn` site-discovery walk,
 //! the operator mappings, the result buckets, and the line-coverage query — no
 //! fs/process/argv/clap); `pipeline` and `report` are the **application** layer
-//! (the mutate loop and the Killed/Survived/Uncovered reporter); [`cli`],
-//! [`manifest`], [`apply`], [`runner`], and [`coverage`] are the outer
+//! (the covered-only mutate loop and the Killed/Survived/Uncovered reporter);
+//! [`cli`], [`manifest`], [`apply`], [`runner`], and `coverage` are the outer
 //! infrastructure adapters (argv parsing, TOML sidecar fs I/O, mutant
 //! apply/restore, the test-command subprocess, and the `cargo-llvm-cov`
-//! invocation). Covered-only gating of the mutate loop lands in T12.
+//! invocation).
+
+#![forbid(unsafe_code)]
 
 pub mod apply;
 pub mod cli;
-pub mod coverage;
-pub mod coverage_map;
+pub(crate) mod coverage;
+pub(crate) mod coverage_map;
 pub mod manifest;
 mod operators;
 pub mod outcome;

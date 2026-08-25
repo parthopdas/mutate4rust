@@ -9,6 +9,20 @@
 //! This module is **Core/domain**: fs-/process-/argv-/clap-free, and it never
 //! `use`s the runner, coverage, or CLI layers. Reading a file from disk belongs
 //! in a later infrastructure adapter, not here — the scanner takes source text.
+//!
+//! # `#[cfg(test)]` items are not discovered (deliberate divergence)
+//!
+//! Items carrying a literal `#[cfg(test)]` attribute — most often the file's own
+//! `mod tests` — are skipped outright. Test-module lines are **always covered by
+//! construction**, so covered-only gating (S5) would preferentially mutate test
+//! code while skipping genuinely uncovered production code; and a mutated
+//! assertion constant is killed by its own test, costing a full compile and
+//! carrying no signal about test quality. Upstream mutate4go never faced this —
+//! Go tests live in a separate `_test.go` file that the one-file-at-a-time model
+//! never selects — so this is a **knowing divergence from upstream**, not a port.
+//!
+//! Only the literal form is recognised (`#[cfg(test)]`); composite predicates such
+//! as `#[cfg(any(test, feature = "x"))]` are not treated as test-only.
 
 use anyhow::{Context, Result};
 use proc_macro2::Span;
@@ -102,12 +116,18 @@ impl SiteCollector {
 
 impl<'ast> Visit<'ast> for SiteCollector {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
         self.scope.push(Frame::Function(node.sig.ident.to_string()));
         visit::visit_item_fn(self, node);
         self.scope.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
         self.scope.push(Frame::Function(node.sig.ident.to_string()));
         visit::visit_impl_item_fn(self, node);
         self.scope.pop();
@@ -120,6 +140,9 @@ impl<'ast> Visit<'ast> for SiteCollector {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
         self.scope
             .push(Frame::Qualifier(self_ty_name(&node.self_ty)));
         visit::visit_item_impl(self, node);
@@ -133,6 +156,9 @@ impl<'ast> Visit<'ast> for SiteCollector {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
         self.scope.push(Frame::Qualifier(node.ident.to_string()));
         visit::visit_item_mod(self, node);
         self.scope.pop();
@@ -159,6 +185,19 @@ impl<'ast> Visit<'ast> for SiteCollector {
             self.push_site(operator, node.span());
         }
     }
+}
+
+/// Whether `attrs` carries a literal `#[cfg(test)]`.
+///
+/// Matching is deliberately literal — the whole `cfg` predicate must be exactly
+/// `test`. A composite such as `#[cfg(any(test, feature = "x"))]` also compiles
+/// outside test builds, so treating it as test-only would silently drop
+/// production sites; the conservative answer there is to keep scanning.
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| match &attr.meta {
+        syn::Meta::List(list) => list.path.is_ident("cfg") && list.tokens.to_string() == "test",
+        _ => false,
+    })
 }
 
 /// Maps a binary operator onto its in-scope [`Operator`], or `None` for operators
@@ -245,7 +284,7 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 3);
-        assert!(sites.iter().all(|s| s.kind == SiteKind::Arithmetic));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Arithmetic));
         assert_eq!(sites[0].operator, Operator::Add);
         assert_eq!(span_text(source, &sites[0]), "+");
         assert_eq!(sites[1].operator, Operator::Sub);
@@ -271,7 +310,7 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 2);
-        assert!(sites.iter().all(|s| s.kind == SiteKind::Arithmetic));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Arithmetic));
         assert_eq!(sites[0].operator, Operator::Div);
         assert_eq!(span_text(source, &sites[0]), "/");
         assert_eq!(sites[1].operator, Operator::Rem);
@@ -315,8 +354,12 @@ mod tests {
                 (Operator::RemAssign, "%="),
             ],
         );
-        assert!(sites.iter().all(|s| s.kind == SiteKind::CompoundAssignment
-            && s.function_id.as_deref() == Some("compound")),);
+        assert!(
+            sites
+                .iter()
+                .all(|s| s.kind() == SiteKind::CompoundAssignment
+                    && s.function_id.as_deref() == Some("compound")),
+        );
         // Byte-exact: each span is the operator's own offset pair, width 2.
         for (site, token) in sites.iter().zip(["+=", "-=", "*=", "/=", "%="]) {
             let expected_start = source.find(token).expect("token is in the fixture");
@@ -447,7 +490,7 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 4);
-        assert!(sites.iter().all(|s| s.kind == SiteKind::Comparison));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Comparison));
         let found: Vec<(Operator, &str)> = sites
             .iter()
             .map(|s| (s.operator, span_text(source, s)))
@@ -472,7 +515,7 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 2);
-        assert!(sites.iter().all(|s| s.kind == SiteKind::Equality));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Equality));
         assert_eq!(sites[0].operator, Operator::Equal);
         assert_eq!(span_text(source, &sites[0]), "==");
         assert_eq!(sites[1].operator, Operator::NotEqual);
@@ -488,7 +531,7 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 2);
-        assert!(sites.iter().all(|s| s.kind == SiteKind::Logical));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Logical));
         assert_eq!(sites[0].operator, Operator::And);
         assert_eq!(span_text(source, &sites[0]), "&&");
         assert_eq!(sites[1].operator, Operator::Or);
@@ -501,7 +544,7 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 2);
-        assert!(sites.iter().all(|s| s.kind == SiteKind::BooleanLiteral));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::BooleanLiteral));
         assert_eq!(sites[0].operator, Operator::True);
         assert_eq!(span_text(source, &sites[0]), "true");
         assert_eq!(sites[1].operator, Operator::False);
@@ -519,11 +562,75 @@ mod tests {
         let sites = scan(source);
 
         assert_eq!(sites.len(), 2, "only 0 and 1 are constant sites");
-        assert!(sites.iter().all(|s| s.kind == SiteKind::Constant));
+        assert!(sites.iter().all(|s| s.kind() == SiteKind::Constant));
         assert_eq!(sites[0].operator, Operator::Zero);
         assert_eq!(span_text(source, &sites[0]), "0");
         assert_eq!(sites[1].operator, Operator::One);
         assert_eq!(span_text(source, &sites[1]), "1");
+    }
+
+    /// Sites inside the file's own `#[cfg(test)] mod tests` are never discovered
+    /// — the deliberate divergence from upstream recorded in the module header.
+    ///
+    /// The identical body **without** the attribute is scanned, so this proves
+    /// the attribute is what suppresses discovery, not the module nesting or an
+    /// unrelated scanner gap.
+    #[test]
+    fn sites_inside_a_cfg_test_module_are_not_discovered() {
+        const BODY: &str = concat!(
+            "fn production(a: i32, b: i32) -> i32 { a + b }\n",
+            "mod tests {\n",
+            "    fn helper(c: i32, d: i32) -> i32 { c * d }\n",
+            "}\n",
+        );
+
+        let without_attribute = scan(BODY);
+        assert_eq!(
+            without_attribute
+                .iter()
+                .map(|s| s.operator)
+                .collect::<Vec<_>>(),
+            vec![Operator::Add, Operator::Mul],
+            "control: the same body is scanned when not marked test-only",
+        );
+
+        let sites = scan(&BODY.replace("mod tests {", "#[cfg(test)]\nmod tests {"));
+        assert_eq!(
+            sites.iter().map(|s| s.operator).collect::<Vec<_>>(),
+            vec![Operator::Add],
+            "the `c * d` site inside `#[cfg(test)] mod tests` must be skipped",
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_function_is_not_discovered() {
+        let sites = scan(concat!(
+            "fn production(a: i32, b: i32) -> i32 { a + b }\n",
+            "#[cfg(test)]\n",
+            "fn only_in_tests(c: i32, d: i32) -> i32 { c * d }\n",
+        ));
+
+        assert_eq!(
+            sites.iter().map(|s| s.operator).collect::<Vec<_>>(),
+            vec![Operator::Add],
+        );
+    }
+
+    /// Only the literal `#[cfg(test)]` suppresses discovery: a composite
+    /// predicate still compiles in a non-test build, so its sites stay in scope.
+    #[test]
+    fn a_composite_cfg_predicate_is_still_scanned() {
+        let sites = scan(concat!(
+            "#[cfg(any(test, feature = \"extra\"))]\n",
+            "mod maybe {\n",
+            "    fn f(c: i32, d: i32) -> i32 { c * d }\n",
+            "}\n",
+        ));
+
+        assert_eq!(
+            sites.iter().map(|s| s.operator).collect::<Vec<_>>(),
+            vec![Operator::Mul],
+        );
     }
 
     #[test]

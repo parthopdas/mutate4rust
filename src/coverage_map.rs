@@ -37,13 +37,13 @@
 /// dropped: coverage is queried per line, so sub-line precision would only
 /// invite disagreement between two sites on the same line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Region {
+pub(crate) struct Region {
     /// First line of the region (1-based, inclusive).
-    pub start_line: usize,
+    pub(crate) start_line: usize,
     /// Last line of the region (1-based, inclusive).
-    pub end_line: usize,
+    pub(crate) end_line: usize,
     /// How many times the region executed; `0` means not covered.
-    pub count: u64,
+    pub(crate) count: u64,
 }
 
 /// Line coverage for a **single source file**, queried by line number.
@@ -52,14 +52,14 @@ pub struct Region {
 /// answer when the profile holds no data for the file at all, and the same
 /// behaviour as upstream's `Covered` against an absent profile entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CoverageMap {
+pub(crate) struct CoverageMap {
     regions: Vec<Region>,
 }
 
 impl CoverageMap {
     /// Builds a map from the regions belonging to one file.
     #[must_use]
-    pub fn new(regions: Vec<Region>) -> Self {
+    pub(crate) fn new(regions: Vec<Region>) -> Self {
         Self { regions }
     }
 
@@ -69,7 +69,7 @@ impl CoverageMap {
     /// is the whole key, so a multi-site line can never split into covered and
     /// uncovered sites.
     #[must_use]
-    pub fn is_line_covered(&self, line: usize) -> bool {
+    pub(crate) fn is_line_covered(&self, line: usize) -> bool {
         self.regions
             .iter()
             .any(|region| region.count > 0 && region.start_line <= line && line <= region.end_line)
@@ -78,7 +78,7 @@ impl CoverageMap {
     /// Whether the map holds no regions at all — i.e. the profile said nothing
     /// about this file, so every line reads as uncovered.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }
 }

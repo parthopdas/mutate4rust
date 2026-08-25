@@ -32,7 +32,29 @@
 //! "nothing is covered" would invert the gate. The two failure modes are kept
 //! distinct in the message: *not installed* ([`ensure_backend_installed`]) versus
 //! *installed but the run failed* ([`generate`]).
+//!
+//! # Region `kind` (tuple index 7) is deliberately ignored
+//!
+//! A region tuple's trailing field distinguishes Code / Expansion / Skipped / Gap
+//! / Branch / MC-DC regions; every kind is treated alike here. That is an
+//! **accepted, one-directional inaccuracy**: the coverage rule is monotone, so a
+//! zero-count region of any kind can never *remove* coverage, and a non-zero-count
+//! Gap/Expansion region can only ever *over*-mark a line as covered. Over-marking
+//! means we mutate a site we might have skipped and then report the survivor —
+//! visible. Under-reporting would silently skip sites — invisible. We take the
+//! visible direction. The consequence to know: our covered/uncovered split may not
+//! match `cargo llvm-cov report`'s own line percentages, which exclude gap-only
+//! lines.
+//!
+//! # Format drift is rejected, not guessed at
+//!
+//! The tuple indices below are positional, so a future export that *reordered*
+//! fields would be read silently at the wrong offsets — a covered file reported as
+//! uncovered, which is exactly the silent wrong answer R8 exists to forbid. The
+//! document's `type` and `version` **major** are therefore asserted before any
+//! tuple is read ([`EXPECT_TYPE`], [`EXPECT_VERSION_MAJOR`]).
 
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -44,6 +66,17 @@ use crate::coverage_map::{CoverageMap, Region};
 
 /// Coverage profile location, relative to the crate root (A2).
 const PROFILE_RELATIVE_PATH: &str = "target/coverage/coverage.json";
+
+/// Upstream mutate4go's stdout notice on the `--reuse-coverage` path, verbatim.
+/// It is the user's only signal that the gate may be classifying against a stale
+/// profile.
+pub(crate) const REUSE_NOTICE: &str =
+    "Reusing existing coverage; covered/uncovered classification may be stale.";
+
+/// The only `type` this parser claims to understand.
+const EXPECT_TYPE: &str = "llvm.coverage.json.export";
+/// The only export `version` **major** this parser claims to understand.
+const EXPECT_VERSION_MAJOR: &str = "3";
 
 /// Actionable install hint for an absent coverage backend (R8).
 const MISSING_BACKEND_HINT: &str = "the coverage backend is not installed \
@@ -65,7 +98,7 @@ const REGION_FILE_ID: usize = 5;
 
 /// Where the coverage profile for `crate_root` lives.
 #[must_use]
-pub fn profile_path(crate_root: &Path) -> PathBuf {
+pub(crate) fn profile_path(crate_root: &Path) -> PathBuf {
     crate_root.join(PROFILE_RELATIVE_PATH)
 }
 
@@ -75,23 +108,19 @@ pub fn profile_path(crate_root: &Path) -> PathBuf {
 ///
 /// Returns an error naming both install commands when `cargo llvm-cov --version`
 /// cannot be spawned or exits non-zero.
-pub fn ensure_backend_installed() -> Result<()> {
+pub(crate) fn ensure_backend_installed() -> Result<()> {
     check_backend(&backend_probe())
 }
 
 /// The command used to prove the backend is present.
-fn backend_probe() -> Vec<String> {
-    vec![
-        "cargo".to_owned(),
-        "llvm-cov".to_owned(),
-        "--version".to_owned(),
-    ]
+fn backend_probe() -> Vec<OsString> {
+    vec!["cargo".into(), "llvm-cov".into(), "--version".into()]
 }
 
 /// Runs `probe` purely for its exit status, mapping any failure onto the install
 /// hint. Parameterised on the command so the missing-tool path is testable on a
 /// machine where the real backend *is* installed.
-fn check_backend(probe: &[String]) -> Result<()> {
+fn check_backend(probe: &[OsString]) -> Result<()> {
     let (program, args) = probe
         .split_first()
         .context("coverage probe command is empty")?;
@@ -113,9 +142,10 @@ fn check_backend(probe: &[String]) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the backend is not installed, if the coverage run itself
-/// fails (a distinct, non-install message), or if the resulting profile cannot be
-/// read or parsed.
-pub fn generate(crate_root: &Path, target: &Path) -> Result<CoverageMap> {
+/// fails (a distinct, non-install message), if the resulting profile cannot be
+/// read or parsed, or if the profile says **nothing at all** about `target` —
+/// see [`ensure_not_empty`].
+pub(crate) fn generate(crate_root: &Path, target: &Path) -> Result<CoverageMap> {
     ensure_backend_installed()?;
 
     let profile = profile_path(crate_root);
@@ -131,7 +161,60 @@ pub fn generate(crate_root: &Path, target: &Path) -> Result<CoverageMap> {
 
     run_coverage(&coverage_command(&profile), crate_root)?;
 
-    load(&profile, target)
+    let export = read_export(&profile)?;
+    let map = map_for(&export, target)?;
+    ensure_not_empty(&map, &export, target, &profile)?;
+    Ok(map)
+}
+
+/// Refuses a **successfully generated** profile that says nothing about `target`.
+///
+/// Reporting "everything uncovered, zero mutants, exit 0" is the one silent wrong
+/// answer this module exists to prevent, and an empty map right after a green
+/// coverage run is far more often a path mismatch (casing, a symlinked or
+/// relocated tree) than a genuinely untested file. So it fails, naming the target,
+/// the profile, and every filename the export *did* contain, which is what makes
+/// a mismatch diagnosable at a glance.
+///
+/// `--reuse-coverage` deliberately does **not** apply this check: a stale profile
+/// legitimately may not mention the file, and the reuse notice already warns.
+fn ensure_not_empty(
+    map: &CoverageMap,
+    export: &Export,
+    target: &Path,
+    profile: &Path,
+) -> Result<()> {
+    if !map.is_empty() {
+        return Ok(());
+    }
+    let present = export_filenames(export);
+    let listed = if present.is_empty() {
+        "    (the export contains no files at all)".to_owned()
+    } else {
+        present
+            .iter()
+            .map(|name| format!("    {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    bail!(
+        "coverage ran successfully but `{}` holds no coverage data for `{}`\n\
+         this is usually a path mismatch, not an untested file\n\
+         the export covers:\n{listed}",
+        profile.display(),
+        target.display(),
+    )
+}
+
+/// Every filename the export mentions, deduplicated and ordered.
+fn export_filenames(export: &Export) -> BTreeSet<&str> {
+    export
+        .data
+        .iter()
+        .flat_map(|data| &data.functions)
+        .flat_map(|function| &function.filenames)
+        .map(String::as_str)
+        .collect()
 }
 
 /// The command that writes the coverage profile to `profile`.
@@ -180,13 +263,14 @@ fn run_coverage(command: &[OsString], crate_root: &Path) -> Result<()> {
 ///
 /// Absence is a hard error, matching upstream mutate4go's `ensureCoverage`, which
 /// errors with "`--reuse-coverage` was requested, but … does not exist" rather
-/// than regenerating or treating everything as uncovered.
+/// than regenerating or treating everything as uncovered. On success it prints
+/// upstream's [`REUSE_NOTICE`] to stdout, verbatim.
 ///
 /// # Errors
 ///
 /// Returns an error if no profile exists at [`profile_path`], or if the profile
 /// cannot be read or parsed.
-pub fn reuse(crate_root: &Path, target: &Path) -> Result<CoverageMap> {
+pub(crate) fn reuse(crate_root: &Path, target: &Path) -> Result<CoverageMap> {
     let profile = profile_path(crate_root);
     // `is_file` folds "absent" and "unreadable metadata" into one answer; both
     // mean the profile cannot be reused, so the remedy printed below is the same.
@@ -197,14 +281,21 @@ pub fn reuse(crate_root: &Path, target: &Path) -> Result<CoverageMap> {
             profile.display()
         );
     }
+    println!("{REUSE_NOTICE}");
     load(&profile, target)
 }
 
 /// Reads a profile from disk and parses it for `target`.
 fn load(profile: &Path, target: &Path) -> Result<CoverageMap> {
+    map_for(&read_export(profile)?, target)
+        .with_context(|| format!("failed to parse coverage profile `{}`", profile.display()))
+}
+
+/// Reads and validates the export document at `profile`.
+fn read_export(profile: &Path) -> Result<Export> {
     let json = std::fs::read_to_string(profile)
         .with_context(|| format!("failed to read coverage profile `{}`", profile.display()))?;
-    parse_export(&json, target)
+    parse_document(&json)
         .with_context(|| format!("failed to parse coverage profile `{}`", profile.display()))
 }
 
@@ -213,12 +304,54 @@ fn load(profile: &Path, target: &Path) -> Result<CoverageMap> {
 ///
 /// # Errors
 ///
-/// Returns an error if the document is not valid JSON in the expected shape, if a
-/// region tuple is shorter than [`REGION_FIELDS`], or if a region names a
-/// `file_id` the function does not declare.
-pub fn parse_export(json: &str, target: &Path) -> Result<CoverageMap> {
+/// Returns an error if the document is not valid JSON in the expected shape, if
+/// its `type`/`version` are not the format this parser understands, if a region
+/// tuple is shorter than [`REGION_FIELDS`], or if a region names a `file_id` the
+/// function does not declare.
+#[cfg(test)]
+pub(crate) fn parse_export(json: &str, target: &Path) -> Result<CoverageMap> {
+    map_for(&parse_document(json)?, target)
+}
+
+/// Deserializes an export and rejects a document this parser does not understand.
+///
+/// The `type`/major-`version` assertion is the format-drift guard: the region
+/// tuple is read **positionally**, so a reordered future format must fail loudly
+/// here rather than be misread at the wrong indices.
+fn parse_document(json: &str) -> Result<Export> {
     let export: Export =
         serde_json::from_str(json).context("failed to parse the cargo-llvm-cov JSON export")?;
+    if export.export_type != EXPECT_TYPE {
+        bail!(
+            "unsupported coverage export type `{}`, expected `{EXPECT_TYPE}`",
+            export.export_type
+        );
+    }
+    let major = export
+        .version
+        .split('.')
+        .next()
+        .unwrap_or(export.version.as_str());
+    if major != EXPECT_VERSION_MAJOR {
+        bail!(
+            "unsupported coverage export version `{}`, expected major version \
+             {EXPECT_VERSION_MAJOR} (the region tuple is read positionally, so a \
+             reordered format must not be guessed at)",
+            export.version
+        );
+    }
+    Ok(export)
+}
+
+/// Maps the regions belonging to `target` onto lines, discarding every region
+/// belonging to another file.
+fn map_for(export: &Export, target: &Path) -> Result<CoverageMap> {
+    // llvm-cov emits absolute native paths; canonicalising the target lets the
+    // comparison be exact (and, on Windows, case-correct) whenever the OS can
+    // supply it. Failure is expected and fine — see `matches_target`.
+    let canonical = std::fs::canonicalize(target).ok();
+    // One filesystem question per distinct filename, not per region.
+    let mut decided: HashMap<&str, bool> = HashMap::new();
 
     let mut regions = Vec::new();
     for data in &export.data {
@@ -236,7 +369,10 @@ pub fn parse_export(json: &str, target: &Path) -> Result<CoverageMap> {
                     .filenames
                     .get(file_id)
                     .with_context(|| format!("coverage region names unknown file id {file_id}"))?;
-                if !matches_target(filename, target) {
+                let matches = *decided
+                    .entry(filename.as_str())
+                    .or_insert_with(|| matches_target(filename, target, canonical.as_deref()));
+                if !matches {
                     continue;
                 }
                 regions.push(Region {
@@ -259,12 +395,23 @@ fn line_number(raw: u64) -> Result<usize> {
 
 /// Whether the export's `candidate` filename denotes `target`.
 ///
-/// llvm-cov emits absolute, platform-native paths while the CLI's target may be
-/// relative, so the target's path segments must be a **suffix** of the
-/// candidate's — the same normalise-then-suffix-match rule upstream mutate4go
-/// applies to Go coverage profiles. Separators are normalised, so a Windows
-/// `C:\work\covfix\src\lib.rs` matches a `src/lib.rs` target.
-fn matches_target(candidate: &str, target: &Path) -> bool {
+/// **Preferred rule — canonical identity.** When both paths resolve on disk they
+/// are compared canonically, which is exact and, on Windows, resolves the on-disk
+/// casing rather than guessing at it (a user typing `SRC/Lib.rs` opens and scans
+/// the file fine, and would otherwise match nothing in the export). Both sides go
+/// through `canonicalize`, so Windows' `\\?\` prefix appears on both or neither.
+///
+/// **Fallback — normalise then suffix-match.** When either path does not resolve
+/// (a profile captured on another machine, or a hand-written fixture), the
+/// target's path segments must be a **suffix** of the candidate's — the same rule
+/// upstream mutate4go applies to Go coverage profiles. Separators are normalised,
+/// so a Windows `C:\work\covfix\src\lib.rs` matches a `src/lib.rs` target.
+fn matches_target(candidate: &str, target: &Path, canonical_target: Option<&Path>) -> bool {
+    if let Some(canonical_target) = canonical_target
+        && let Ok(canonical_candidate) = std::fs::canonicalize(candidate)
+    {
+        return canonical_candidate == canonical_target;
+    }
     let candidate = normalise(candidate);
     let target = normalise(&target.display().to_string());
     let candidate = path_segments(&candidate);
@@ -287,10 +434,14 @@ fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|part| !part.is_empty()).collect()
 }
 
-/// Top level of the llvm-cov JSON export. Unknown fields (`type`, `version`,
-/// `files`, summaries…) are ignored — we consume only the region tuples.
+/// Top level of the llvm-cov JSON export. `type` and `version` are read to reject
+/// format drift (see the module header); the remaining unknown fields (`files`,
+/// summaries…) are ignored — we consume only the region tuples.
 #[derive(Debug, Deserialize)]
 struct Export {
+    #[serde(rename = "type")]
+    export_type: String,
+    version: String,
     data: Vec<ExportData>,
 }
 
@@ -311,13 +462,21 @@ struct ExportFunction {
 #[cfg(test)]
 mod tests {
     use super::{
-        MISSING_BACKEND_HINT, backend_probe, check_backend, coverage_command, matches_target,
-        parse_export, profile_path, reuse, run_coverage,
+        EXPECT_TYPE, Export, MISSING_BACKEND_HINT, REUSE_NOTICE, backend_probe, check_backend,
+        coverage_command, ensure_not_empty, matches_target, parse_export, profile_path, reuse,
+        run_coverage,
     };
+    use crate::coverage_map::CoverageMap;
     use crate::scanner;
     use crate::site::{Operator, Site};
     use std::ffi::OsString;
     use std::path::Path;
+
+    /// Wraps `data` in the document envelope every real export carries, so an
+    /// inline fixture exercises the same `type`/`version` guard production does.
+    fn document(data: &str) -> String {
+        format!(r#"{{"type":"{EXPECT_TYPE}","version":"3.1.0","data":{data}}}"#)
+    }
 
     /// A `cargo llvm-cov --json` capture (cargo-llvm-cov 0.9.0, export version
     /// 3.1.0) taken against [`FIXTURE_SOURCE`], **reduced** — not verbatim: the
@@ -374,20 +533,12 @@ mod tests {
 
     /// A one-line script run through the platform's own shell, so both process
     /// failure modes can be provoked without touching the real backend.
-    fn shell_command(windows: &str, unix: &str) -> Vec<String> {
+    fn shell_command(windows: &str, unix: &str) -> Vec<OsString> {
         if cfg!(windows) {
-            vec!["cmd".to_owned(), "/C".to_owned(), windows.to_owned()]
+            vec!["cmd".into(), "/C".into(), windows.into()]
         } else {
-            vec!["sh".to_owned(), "-c".to_owned(), unix.to_owned()]
+            vec!["sh".into(), "-c".into(), unix.into()]
         }
-    }
-
-    /// [`shell_command`] shaped for the coverage-run seam.
-    fn os_shell_command(windows: &str, unix: &str) -> Vec<OsString> {
-        shell_command(windows, unix)
-            .into_iter()
-            .map(OsString::from)
-            .collect()
     }
 
     #[test]
@@ -410,7 +561,7 @@ mod tests {
     fn an_unavailable_backend_fails_with_both_install_commands() {
         // R8: proven without uninstalling anything — the probe command is a seam,
         // so an unresolvable program stands in for an absent backend.
-        let err = check_backend(&["mutate4rust-no-such-coverage-backend".to_owned()])
+        let err = check_backend(&[OsString::from("mutate4rust-no-such-coverage-backend")])
             .expect_err("an unresolvable backend must fail loudly");
         let message = format!("{err:#}");
 
@@ -539,7 +690,7 @@ mod tests {
     #[test]
     fn a_successful_coverage_run_is_not_an_error() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        assert!(run_coverage(&os_shell_command("exit 0", "exit 0"), dir.path()).is_ok());
+        assert!(run_coverage(&shell_command("exit 0", "exit 0"), dir.path()).is_ok());
     }
 
     #[test]
@@ -563,6 +714,36 @@ mod tests {
         assert!(
             message.contains("target") && message.contains("coverage.json"),
             "the message must name the profile it looked for: {message}"
+        );
+    }
+
+    /// `reuse`'s **success** path: an existing profile is read from disk and
+    /// parsed into exactly the map `parse_export` produces from the same bytes.
+    /// (Only the absent-profile error was covered before, leaving `load`'s read
+    /// path untested.)
+    #[test]
+    fn reuse_reads_an_existing_profile_and_parses_it() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let profile = profile_path(dir.path());
+        std::fs::create_dir_all(profile.parent().expect("profile has a parent"))
+            .expect("create coverage dir");
+        std::fs::write(&profile, FIXTURE_EXPORT).expect("seed profile");
+
+        let reused = reuse(dir.path(), fixture_target()).expect("an existing profile is reusable");
+        let parsed = parse_export(FIXTURE_EXPORT, fixture_target()).expect("fixture parses");
+
+        assert_eq!(reused, parsed);
+        assert!(reused.is_line_covered(4));
+        assert!(!reused.is_line_covered(11));
+    }
+
+    /// Pins the notice's wording to the string upstream prints. (That it *reaches
+    /// stdout* on the reuse path is behaviour proven end-to-end in `tests/e2e.rs`.)
+    #[test]
+    fn the_reuse_notice_pins_upstreams_wording() {
+        assert_eq!(
+            REUSE_NOTICE,
+            "Reusing existing coverage; covered/uncovered classification may be stale."
         );
     }
 
@@ -647,47 +828,190 @@ mod tests {
     fn a_short_region_tuple_is_an_error() {
         // A format change must fail loudly rather than silently drop regions and
         // report a covered file as uncovered.
-        let json = r#"{"data":[{"functions":[{"filenames":["src/lib.rs"],"regions":[[1,1,2]]}]}]}"#;
-        let err = parse_export(json, fixture_target()).expect_err("short tuple must error");
+        let json =
+            document(r#"[{"functions":[{"filenames":["src/lib.rs"],"regions":[[1,1,2]]}]}]"#);
+        let err = parse_export(&json, fixture_target()).expect_err("short tuple must error");
         assert!(format!("{err:#}").contains("expected at least"), "{err:#}");
     }
 
     #[test]
     fn a_region_naming_an_unknown_file_id_is_an_error() {
-        let json = r#"{"data":[{"functions":[{"filenames":["src/lib.rs"],"regions":[[1,1,2,1,1,7,0,0]]}]}]}"#;
-        let err = parse_export(json, fixture_target()).expect_err("bad file id must error");
+        let json = document(
+            r#"[{"functions":[{"filenames":["src/lib.rs"],"regions":[[1,1,2,1,1,7,0,0]]}]}]"#,
+        );
+        let err = parse_export(&json, fixture_target()).expect_err("bad file id must error");
         assert!(format!("{err:#}").contains("unknown file id"), "{err:#}");
+    }
+
+    /// A non-zero `file_id` really does index into the function's `filenames` — a
+    /// multi-file function (macro expansion, `include!`) is the shape the single-
+    /// entry fixture could not exercise. The region belonging to the *second*
+    /// entry is the one we want; the first-entry region must be discarded.
+    #[test]
+    fn a_non_zero_file_id_selects_the_right_filename() {
+        let json = document(
+            r#"[{"functions":[{"filenames":["src/other.rs","src/lib.rs"],
+               "regions":[[1,1,1,9,7,0,0,0],[42,1,44,9,5,1,0,0]]}]}]"#,
+        );
+        let map = parse_export(&json, fixture_target()).expect("parses");
+
+        assert!(
+            map.is_line_covered(43),
+            "the file_id=1 region belongs to src/lib.rs"
+        );
+        assert!(
+            !map.is_line_covered(1),
+            "the file_id=0 region belongs to src/other.rs and must be discarded"
+        );
     }
 
     #[test]
     fn an_export_without_functions_yields_an_empty_map() {
-        let json = r#"{"data":[{"files":[]}]}"#;
-        let map = parse_export(json, fixture_target()).expect("parses");
+        let json = document(r#"[{"files":[]}]"#);
+        let map = parse_export(&json, fixture_target()).expect("parses");
         assert!(map.is_empty());
     }
 
+    /// Format-drift guard: an unexpected document `type` is rejected by name,
+    /// because the region tuple is read positionally and a different document
+    /// cannot be safely guessed at.
     #[test]
-    fn path_matching_is_suffix_based_and_separator_agnostic() {
+    fn an_unexpected_export_type_is_rejected() {
+        let json = r#"{"type":"llvm.coverage.json.summary","version":"3.1.0","data":[]}"#;
+        let err = parse_export(json, fixture_target()).expect_err("a foreign type must error");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("unsupported coverage export type"),
+            "{message}"
+        );
+        assert!(message.contains("llvm.coverage.json.summary"), "{message}");
+    }
+
+    /// A new **major** export version is rejected; a new minor/patch of the major
+    /// we understand is accepted (the fixture itself is 3.1.0).
+    #[test]
+    fn an_unexpected_major_export_version_is_rejected_but_a_new_minor_is_not() {
+        let regions =
+            r#"[{"functions":[{"filenames":["src/lib.rs"],"regions":[[1,1,1,9,1,0,0,0]]}]}]"#;
+
+        let future = format!(r#"{{"type":"{EXPECT_TYPE}","version":"4.0.0","data":{regions}}}"#);
+        let err = parse_export(&future, fixture_target()).expect_err("a new major must error");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unsupported coverage export version"),
+            "{message}"
+        );
+        assert!(message.contains("4.0.0"), "{message}");
+
+        let minor = format!(r#"{{"type":"{EXPECT_TYPE}","version":"3.9.1","data":{regions}}}"#);
+        let map = parse_export(&minor, fixture_target()).expect("a new minor must still parse");
+        assert!(map.is_line_covered(1));
+    }
+
+    /// The mandatory backstop: an empty map after a *successful* coverage
+    /// generation is a hard error naming the target, the profile, and what the
+    /// export did contain — never a silent "everything uncovered, exit 0".
+    #[test]
+    fn an_empty_map_after_a_successful_run_is_an_error_that_lists_the_export() {
+        let export: Export =
+            serde_json::from_str(FIXTURE_EXPORT).expect("the fixture deserializes");
+        let err = ensure_not_empty(
+            &CoverageMap::default(),
+            &export,
+            Path::new("src/typo.rs"),
+            Path::new("target/coverage/coverage.json"),
+        )
+        .expect_err("an empty map must not pass silently");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("src/typo.rs"), "{message}");
+        assert!(message.contains("coverage.json"), "{message}");
+        assert!(message.contains("path mismatch"), "{message}");
+        assert!(
+            message.contains(r"C:\work\covfix\src\lib.rs"),
+            "the export's own filenames must be listed: {message}"
+        );
+    }
+
+    /// A non-empty map is waved through — the backstop must not fire on a healthy
+    /// run.
+    #[test]
+    fn a_non_empty_map_passes_the_backstop() {
+        let export: Export =
+            serde_json::from_str(FIXTURE_EXPORT).expect("the fixture deserializes");
+        let map = parse_export(FIXTURE_EXPORT, fixture_target()).expect("fixture parses");
+        assert!(
+            ensure_not_empty(
+                &map,
+                &export,
+                fixture_target(),
+                Path::new("target/coverage/coverage.json")
+            )
+            .is_ok()
+        );
+    }
+
+    /// The fallback rule, exercised with paths that do not exist on disk so
+    /// canonicalisation cannot apply.
+    #[test]
+    fn path_matching_falls_back_to_suffix_matching_and_is_separator_agnostic() {
         assert!(matches_target(
             r"C:\work\covfix\src\lib.rs",
-            Path::new("src/lib.rs")
+            Path::new("src/lib.rs"),
+            None
         ));
         assert!(matches_target(
             "/home/dev/covfix/src/lib.rs",
-            Path::new("src/lib.rs")
+            Path::new("src/lib.rs"),
+            None
         ));
         assert!(matches_target(
             "/home/dev/covfix/src/lib.rs",
-            Path::new("./src/lib.rs")
+            Path::new("./src/lib.rs"),
+            None
         ));
         // Partial segment names must not match — `lib.rs` is not `mylib.rs`.
         assert!(!matches_target(
             "/home/dev/covfix/src/mylib.rs",
-            Path::new("src/lib.rs")
+            Path::new("src/lib.rs"),
+            None
         ));
         assert!(!matches_target(
             "src/lib.rs",
-            Path::new("covfix/src/lib.rs")
+            Path::new("covfix/src/lib.rs"),
+            None
         ));
+    }
+
+    /// The preferred rule: when both sides resolve on disk they are compared
+    /// canonically. On Windows this makes a differently-cased target match (the
+    /// suffix rule alone would not); on every platform it makes two different
+    /// real files *not* match.
+    #[test]
+    fn path_matching_prefers_canonical_identity_when_both_paths_resolve() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source = dir.path().join("lib.rs");
+        let other = dir.path().join("other.rs");
+        std::fs::write(&source, "fn f() {}\n").expect("seed source");
+        std::fs::write(&other, "fn g() {}\n").expect("seed other");
+
+        let canonical = std::fs::canonicalize(&source).expect("canonicalize source");
+        let candidate = source.display().to_string();
+
+        assert!(matches_target(&candidate, &source, Some(&canonical)));
+        assert!(
+            !matches_target(&other.display().to_string(), &source, Some(&canonical)),
+            "a different real file must not match"
+        );
+
+        if cfg!(windows) {
+            // The case hole the backstop was written for: an upper-cased target
+            // opens and scans fine, and canonicalisation makes it match too.
+            let shouty = dir.path().join("LIB.RS");
+            let shouty_canonical =
+                std::fs::canonicalize(&shouty).expect("canonicalize the recased target");
+            assert!(matches_target(&candidate, &shouty, Some(&shouty_canonical)));
+        }
     }
 }
