@@ -96,8 +96,9 @@ One or more tasks per slice.
 | T11 | S5 | `cargo-llvm-cov` invocation + profile parse; region→line coverage map; **add `llvm-tools-preview` + `cargo-llvm-cov` to both CI legs**; **verify A6 `--reuse-coverage`-without-coverage against upstream**. | Done | `a89ae64` |
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Done | `2cf768c` |
 | T13a | S6 | Token-level Rust operators that fit the current `Site` model: **float constants (`0.0↔1.0`, suffix preserved)**, bitwise (`&`↔`|`, `^→&`, `<<`↔`>>`), predicate-method swaps (`.is_some()`↔`.is_none()`, `.is_ok()`↔`.is_err()`). Plus T12 housekeeping: score-line qualifier, `#[cfg(test)]` gated in all **four** attribute-bearing item enums (`Item`, `ForeignItem`, `TraitItem`, `ImplItem`), `parse_export` into `mod tests`, target pre-flight parse. Also fixes a latent defect: `0f64` parses as a suffixed `LitInt` and was emitted as an integer site whose mapping then aborted the run. | Done | `3498087` |
-| T13b | S6 | (1) extract `mutant_source(original, site)` (owed from T12); (2) `KillReason::CompileError` **before** any undecidable-precondition operator ships; (3) scanner↔mapping **totality property test**; (4) **no sites inside `syn::Type`** rule; (5) `Stmt`/`Arm` cfg gate sweep; (6) structural operators that fit the current model (`Some(x)→None`, `Ok(x)→Err(_)`, `expr?→expr.unwrap()`, `.unwrap()`/`.expect(_)→.unwrap_or_default()`, match-arm **guard drop**) + record rendering generalizes `canonical_token` → mutation description; (7) bump `Operator::ALL.len()` deliberately. **No Core model change.** | Pending | - |
-| T13c | S6 | `Vec<Edit>` + `splice_all` (descending start order) driven by **arm-body swap alone** — the only S6 operator that cannot be one edit. `replacement` survives as the single-token fast path. Blast radius: `site.rs`, `apply.rs` (+1 fn), one block in `pipeline.rs`. | Pending | - |
+| T13b | S6 | (1) extract `mutant_source(original, site)` (owed from T12); (2) `KillReason::CompileError` **before** any undecidable-precondition operator ships; (3) scanner↔mapping **totality property test** (shipped **two-directional**: over-emission *and* under-emission); (4) **no sites inside `syn::Type`** rule; (5) `Stmt`/`Arm` cfg gate sweep; (6) structural operators that fit the current model (`Some(x)→None`, `Ok(x)→Err(_)`, `expr?→expr.unwrap()`, `.unwrap()→.unwrap_or_default()`, match-arm **guard drop**) + record rendering generalizes `canonical_token` → mutation description; (7) bump `Operator::ALL.len()` deliberately. **No Core model change.** Also: `declare_kill_reasons!` replaces the hand-kept `KillReason` roster; partial report printed before bailing on a mapping error. **`.expect(_)` did NOT ship — moved to T13c** (excluded on a premise `push_span` invalidated in the same commit). | Done | `c82cdf6` |
+| T13c | S6 | `Vec<Edit>` + `splice_all` (descending start order) driven by **arm-body swap alone**. **Justification reframed by Anders at T13b close:** the model's limit was never span disjointness — `push_span` proved it is *one contiguous byte range*, which is wider — it is that **`replacement` cannot read source at another location in the file**, and arm-body swap is the only S6 operator whose replacement text lives elsewhere. (It *could* be forced into one edit spanning body₁.start→body₂.end, but `replacement` would have to re-parse a slice; `Vec<Edit>` is the honest model. So T13c remains cleanly **droppable**.) Also absorbs: **`.expect(_)→.unwrap_or_default()`** (~6 lines, single contiguous span via `push_span`); **`visit_variant` cfg gate** + row in the position table; splitting the module header's ungated list into *reachable* vs *currently-unreachable*; **suppress `ConstParam.default`** per the human's T13b-close ruling, with a test and a doc line; add `literals_in_pattern_position_are_sites` and the *why* sentence to the constructor test; move the O3 overlap note to the module header (it now covers `SomeCall`/`Try`, not just arms); one sentence in `push_span` on the file-global monotonic byte-offset invariant. `replacement` survives as the single-token fast path. Blast radius: `site.rs`, `apply.rs` (+1 fn), one block in `pipeline.rs`. **S6 closes here.** | Pending | - |
+| T13d | S6+ | **Roster fold (new, added by Anders at T13b close — after T13c, all-or-nothing).** Declare each operator as a token→replacement pair inside `declare_operators!`, generating the enum, `ALL`, `canonical_token`, `description` (via `concat!`) **and** the token-for-token fast path of `replacement`, with `Zero`/`One`/`FloatZero`/`FloatOne` as declared exceptions routing to their existing functions. Makes `(Some,Some)`/`(None,None)` **unrepresentable** (deletes `structural_description` and its `panic!` arm) and makes **`description`↔`replacement` drift impossible by construction** — the property that actually matters, and the one a description-only fold does *not* address. Collapses three parallel 38/30-arm matches into one list. **Must not share a commit with a Core model change** — it touches the three byte-identical parity mappings (A5/C11). Only then consider merging `declare_operators!`/`declare_kill_reasons!` into one `declare_roster!` — **two instances is not a pattern; do not unify before then.** | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
 | T15 | S7 | `--since-last-run`, `--mutate-all`, `--lines`; post-run manifest update; wire changed-count into `--scan`. | Pending | - |
 | T16 | S8 | `--max-workers` isolated worker dirs (isolated target/source copy, seeded from warmed baseline) + aggregation. | Pending | - |
@@ -143,9 +144,21 @@ same way); **idiomatic** entries are Rust-native additions. All are **active by 
 | `?` operator | `expr? → expr.unwrap()` where the `Try` type permits | idiomatic |
 | Bitwise | `&` ↔ `|`; `^ → &`; `<<` ↔ `>>` | idiomatic |
 
-> Where a mapping's precondition doesn't hold (e.g. no `Default`, incompatible `Try` type), the site
-> is **not** emitted rather than emitting a knowingly non-compiling mutant. Mutants that still fail to
-> compile at test time are classified per A8.
+> **Precondition gating — two kinds, and only one is gated at emission** *(amended at T13b close, human-approved)*.
+> - **Syntactically decidable** preconditions are gated: the site is **not emitted**. These are decidable
+>   from the token stream alone — float spellings (`plain_decimal_float_value`), integer suffixes
+>   (`is_integer_suffix`), call arity, turbofish, qualified paths (`QSelf`).
+> - **Type-dependent** preconditions are **not** gated, because a syntactic tool cannot decide them:
+>   `.unwrap_or_default()` needs `T: Default`, `Ok(x)→Err(x)` a compatible error type,
+>   `expr?→expr.unwrap()` a permitting `Try` type. Acquiring type information means `rustc`-as-a-library —
+>   a different product (see the T13a review). These sites **are** emitted, and a mutant that fails to
+>   compile is classified per A8 as `Killed`, now carrying `KillReason::CompileError` so the cost is
+>   **measurable** rather than silent score inflation. Its magnitude is the instrument for A5's owed
+>   count-divergence measurement.
+>
+> The earlier blanket note — *"where a mapping's precondition doesn't hold, the site is not emitted
+> rather than emitting a knowingly non-compiling mutant"* — stated the opposite of what T13b ships and
+> is superseded by the two rules above.
 
 ## Risks (Rx)
 
@@ -1157,6 +1170,180 @@ and reported separately. Full parity with mutate4go's bucket assignment.
     outward edge remains the sanctioned `pipeline → apply`/`runner`/`coverage`. `preflight_parse` reads
     the file in the adapter and delegates the decision to a pure seam — the right side of the line.
     Seams still take domain primitives; `RunConfig` correctly still does not exist. **S6 remains open.**
+
+- **T13b — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S6 NOT closed — T13c outstanding, plus one operator
+  T13b was scoped to ship and did not.** The seven-step order was followed exactly, the boundary held, and
+  the slice's most valuable output is a *sharpening of what T13c is for*. Verified mechanically, not by
+  assertion: `Vec<Edit>` / `struct Edit` / `splice_all` — **zero occurrences** in `src/`; `RunConfig`
+  absent (the one grep hit is a forward-pointer comment about `--test-command`/T17, the correct place for
+  it); `Site` unchanged (`{ operator, byte_span, line, function_id }`); `replacement`'s signature
+  unchanged; arm-body swap untouched; no new trait seams. `mutant_source` is exactly the single point
+  T13c needs.
+  - **1. `.expect(_)` was in T13b's scope and did not ship, on a premise the same commit invalidated.**
+    The taxonomy row reads `.unwrap()`/`.expect(_)`→`.unwrap_or_default()`. The implementation excludes
+    `.expect` via `method_call_operator`'s arity precondition, documented and tested. The stated reason —
+    "it would leave a stray argument behind" — is true **only under `push_site`**. It is false under
+    **`push_span`, which T13b itself just built**: `.expect("boom")` → `.unwrap_or_default()` is **one
+    contiguous span**, `method.span().start .. paren_token.span.close().end`, the same assembly shape as
+    the arm guard, the same helper, one `replacement` row. Six lines. It is not a T13c operator; it is a
+    T13b operator that fell through. **Record it as moved, not as delivered** — the task record should
+    reflect reality rather than intent.
+  - **2. `push_span` is NOT a `Vec<Edit>` precursor in disguise — it is the opposite, and it re-frames
+    T13c.** It demonstrates that the model's expressive limit was never "one `syn` span" but **one
+    contiguous byte range**, which is strictly wider. It *reduces* pressure for `Vec<Edit>` rather than
+    building toward it.
+    - The sharpening, worth writing down because it changes what T13c is *for*: the real limit of the
+      current model is that **`replacement` is a function of `(Operator, token)` and cannot read source at
+      another location**. Arm-body swap is the only S6 operator whose replacement text lives elsewhere in
+      the file. **That**, not span disjointness, is the justification for `Vec<Edit>`.
+    - Corollary the human should have explicitly: arm-body swap *could* be forced into one edit (span
+      body₁.start → body₂.end, replacement = body₂ + intervening + body₁). It would work and it would be
+      horrible — `replacement` would have to re-parse a slice. `Vec<Edit>` is the honest model, but it is
+      a **clarity** choice, not a necessity. **Arm-body swap therefore remains cleanly droppable, and
+      T13c remains cleanly droppable with it.** That was the entire point of the T13a re-draw and it
+      still holds.
+    - The assembled span itself is **sound; keep it**. Joining `if_token.span().byte_range().start` →
+      `guard.guard.span().byte_range().end` is safe because proc-macro2 fallback offsets are
+      **file-global and monotonic** for a single parse — a load-bearing invariant that is currently
+      implicit; **one sentence in `push_span`'s doc**. Using explicit byte ranges rather than
+      `Span::join` is the better choice (`join` is `Option` and nightly-dependent). 43 probed guard
+      shapes reparsing correctly is adequate evidence; bracketing comments/newlines between `if` and the
+      expression is *correct* — dropping them is what "drop the guard" means.
+    - **O3's overlap note is under-general.** It is documented only on `visit_arm`, but `SomeCall`
+      overlaps too — `Some(x?)` emits an `OptionConstructor` span strictly containing a `TryOperator`
+      span. The argument (mutants applied one at a time over pristine source ⇒ overlap is two independent
+      mutants, never a collision) is identical and correct. **Move it to the module header.**
+    - `SiteKind::MatchArm` will host arm-body swap in T13c with wholly different span semantics.
+      Acceptable 1:many; expect the report line to become the disambiguator. `description()` already
+      handles it.
+  - **3. `KillReason::CompileError` — correctly placed; the instrument is necessary but not yet
+    sufficient for A5.** The detector constants and `is_compile_error` live in `runner` (Infrastructure —
+    classifying process output is adapter knowledge), the *reason* lives in `outcome` (domain), and the
+    dependency points inward. The three buckets are untouched and pinned by
+    `every_kill_reason_folds_into_the_killed_bucket` over the **generated** `ALL`. A8 intact. The ordering
+    fix is the right fix, and proving the collision with **real rustc output** rather than a fixture is
+    exactly the standard this repo has converged on.
+    - **Where it falls short.** A5 owes "count-divergence magnitude once S6 lands". `CompileError` says
+      *how many* mutants never built; it does not say **which operator class** paid that cost — and that
+      is the number deciding whether `Ok→Err` and `?→.unwrap()` earn their place. The data exists (each
+      `MutantRecord` carries the operator) but `summary()` only cross-tabs bucket × reason.
+    - **Ruling: do not build a cross-tab now.** At the A5 measurement task, add a
+      `Killed (compile error):` listing reusing the existing `render()` — the same ~10-line shape as
+      `Survived mutants:`, with the operator name already in the rendered line. That makes A5 answerable
+      by reading the report. Recorded as the A5 dependency.
+    - **Optional hardening, not a blocker:** both detector families use unanchored `contains`. Anchoring
+      the markers to **line start** would make the echoed-source-line collision structurally impossible
+      for both families (`error[E` and `error: could not compile` are line-initial; `attempt to divide by
+      zero` is line-initial in a panic and mid-line in a rustc echo), demoting `classify`'s branch
+      ordering from load-bearing to merely tidy. Consider at T17.
+  - **4. The two open questions Bhaskar declined to decide — one is a defect, not a question.**
+    - **(a) Const-generic parameter defaults — a DISCLOSURE defect first, a product question second.**
+      `struct S<const N: usize = 1>` → 1 site, reaching the scanner via `visit_generics → ConstParam.default`
+      (an `Expr`, so the `visit_type` guard never sees it). **The problem is not that the answer is
+      unclear. It is that this behaviour is in the code, contradicts a written rule in `docs/design.md`,
+      and is recorded nowhere** — not in a test, not in a doc comment, not in the module header's
+      ungated list. T13a was praised precisely for enumerating its own holes; this is a hole that isn't
+      enumerated, and that must be fixed whichever way the behaviour goes.
+      Recommendation: **suppress.** A const-param default is syntactically an expression but semantically
+      a type-level constant; the rule's *purpose* (mutate what a test can observe through evaluated code)
+      points to suppression, and the realistic mutant profile is dominated by compile errors — score
+      inflation with no signal, the exact cost the `visit_type` rule was created to remove. → **Human
+      ruled: SUPPRESS** (see the T13b-close decisions section).
+    - **(b) Literals in pattern position — KEEP. My call, correct as-is.** `match x { 1 => 0, _ => x }`
+      emitting a site for the pattern `1` is a *good* mutant: it compiles, it changes which input matches,
+      a test can observe it — the pattern-position equivalent of mutating a comparison constant. The
+      asymmetry with constructors is principled: **a literal pattern is a comparison against a value; a
+      constructor pattern destructures — it constructs nothing.** What is missing is only the record: add
+      `literals_in_pattern_position_are_sites` so the behaviour is pinned rather than incidental, and put
+      that one-sentence distinction into `constructors_in_pattern_position_are_not_sites`' doc comment.
+      As written the test asserts *what* differs and never says *why*, which is precisely how a future
+      contributor "fixes" it.
+      Note and do **not** act on: **bool** literals in pattern position (`match b { true => …, false => … }`)
+      mutate into a non-exhaustive match — a guaranteed compile error, hence a guaranteed inflated
+      `Killed`. Real and reasonably common. Do not gate it now; `CompileError` will measure it, and it is
+      a good early validation of the instrument. Revisit at the A5 measurement with data, not intuition.
+    - **(c) `syn::Variant` attrs ungated — the ungated list is currently misleading. Fix the doc, and
+      gate it.** The module header lists `Field`, `Variant`, `FnArg`, `GenericParam`, `WherePredicate`,
+      `Pat`, `Type` as ungated, reading as one uniform harmless set. It is not: `Field`, `FnArg`,
+      `WherePredicate`, `Type` are **vacuous** (nothing behind them since `visit_type` stopped recursing),
+      while `Variant` **has teeth** (`enum E { #[cfg(test)] A = 1, B = 0 }` leaks a test-only discriminant
+      site), as do `GenericParam` (per (a)) and `Pat` (per (b)). **Three of seven entries are live leaks
+      presented alongside four dead ones. A list that flattens live holes into dead ones is worse than no
+      list, because it retires the reader's attention** — a direct regression against the standard T13a
+      set. Split it into *"ungated and reachable"* vs *"ungated but currently unreachable, and why."* And
+      gate `Variant`: `syn::Variant` is a plain struct, so a 4-line `visit_variant` plus one row in the
+      position table — symmetric with `Stmt`/`Arm`, no new concepts. Free-ride it on T13c, sequenced
+      **after** (a): if defaults are suppressed, `GenericParam` becomes vacuous and the list shrinks again.
+  - **5. The `structural_description` wildcard — ship as-is; reject both the wildcard-free match AND the
+    half-fold.**
+    - **Ship it.** The `_ => None` wildcard sits over an **owned** domain, which `design.md` forbids — but
+      the enforcement is not in `structural_description`, it is in **the pair**. `canonical_token()` is
+      exhaustive by construction with no wildcard, so a new token-less operator *necessarily* produces
+      `(None, None)` and hits the `panic!`. **`canonical_token`'s exhaustiveness is the load-bearing
+      part; `structural_description` is a lookup, not a roster.** That distinction belongs in one sentence
+      in the test's doc, because as written a reader could reasonably read it as a design.md violation.
+    - **Reject the wildcard-free match.** 35 re-listed variants is a second roster — the disease, not the
+      cure.
+    - **Reject the half-fold too** — and this is where I differ from "follow-up chore". Folding *only*
+      `description` into `declare_operators!` removes variant↔description drift, which is the drift that
+      **doesn't matter**, and buys a second migration later. Bhaskar's own nuance argues against his
+      recommendation's sequencing.
+    - **The coherent version is bigger and better than described** — see the new **T13d** row. It makes
+      `(Some,Some)`/`(None,None)` unrepresentable, makes `description`↔`replacement` drift impossible by
+      construction (the property that actually matters, and the one a description-only fold does *not*
+      address), and collapses three parallel matches into one list. **Its own task, after T13c. Not a
+      chore, not a free-rider** — it touches the three byte-identical parity mappings (A5/C11) and must
+      not land in the same commit as a Core model change. **All or nothing.** Only afterwards consider
+      merging the two macros into one `declare_roster!` — until then, **two instances is not a pattern.**
+  - **6. S6 is closable after T13c**, provided T13c absorbs `.expect`, the `visit_variant` gate + ungated-
+    list correction + (a)'s resolution, and the feature-file taxonomy amendment (all now recorded in the
+    T13c row and the amended Operator Taxonomy note). Two items are S6-*adjacent* and do **not** block
+    closure: the bitwise assign-form taxonomy question (open since T13a) and the A5 measurement itself.
+  - **7. Process — the rule isn't landing because it has no trigger.** Three occurrences (T12, T13a,
+    T13b-round-1), each caught by Bhaskar, one of them *after* the rule was written into `design.md`.
+    - **The rule is well-specified about the remedy and silent about the trigger.** It says what to do
+      *when you have* a hand-kept list. It does not say how to *notice you are creating one* — and at the
+      moment of writing, `const ALL: [KillReason; 3] = [...]` doesn't feel like a hand-kept list, it feels
+      like three obvious variants. **Every one of these three defects was invisible from inside the edit.**
+    - **(i) Give the rule a mechanical trigger, as a question, in `dave.md`'s definition of done:** *"Does
+      this change add an enum we own, a `const ALL`/array literal of our own variants, or a match
+      arm-per-variant over an enum we own? If yes: it is declared by a roster macro, or the task explains
+      why not."* A convention in `design.md` is reference material; a checklist question in the agent file
+      is a gate. This is a **recognition** failure, so the fix must be a recognition prompt.
+    - **(ii) Change the review order for this one class.** Anders currently sees the work after Bhaskar's
+      rounds. A hand-kept roster is a **design** defect, visible in seconds from the diff, and it has now
+      cost three FAIL rounds plus one destroyed working tree. Add a **one-line pre-implementation
+      declaration** from Dave: *"new enums / rosters / lists this task introduces: …"* — before coding,
+      not after. Ten seconds of writing, and it makes the defect visible while it is still free.
+    - **(iii) Then delete the class.** After T13d, `declare_roster!` is the single named home for the
+      pattern and "did you use the roster macro?" becomes mechanical with one right answer. That is the
+      durable fix; (i) and (ii) are the bridge.
+    - **On the round-3 incident:** the two protocol amendments (sabotage custody in `bhaskar.md`,
+      stage-at-done-done in `dave.md`) are the correct responses; I would change nothing. One observation
+      worth keeping: **Dave caught an error in Bhaskar's recovery inventory** — the totality corpus was
+      attributed to `operators.rs`, which had survived intact and never held it. **That is the T13a census
+      failure recurring in a different costume: a claim about what was lost, established by recollection
+      rather than by the artifact.** The surviving files were the contract and they were right; the
+      inventory was narrative and it was wrong. Added to `design.md`'s census rule as a second worked
+      example: *a recovery inventory is a quantitative claim and must be derived from the artifact, never
+      from memory.*
+  - **Nothing in T13b compromises the architecture.** Core stays pure; the detector lives in
+    Infrastructure and the reason in the domain, dependency inward; A8 intact; parity mappings untouched;
+    `RunConfig` correctly still does not exist. **The work is sound; ship it.**
+
+### ⚠ Product decisions owed to the human (raised at T13b close) — RESOLVED
+Both accepted as Anders recommended.
+1. **Const-generic parameter defaults → SUPPRESS.** `visit_const_param` skips `.default`, so
+   `struct S<const N: usize = 1>` stops emitting a site. Consistent with the human-approved
+   no-sites-inside-`syn::Type` rule: a const-param default is syntactically an expression but
+   semantically a **type-level constant**, and its realistic mutant profile is dominated by compile
+   errors — score inflation with no signal. Accepted knowing it **further reduces site counts** and so
+   shifts the A5 count-divergence measurement, which must name this rule as a contributing cause
+   alongside the `syn::Type` rule. Lands at **T13c** with a test row and an entry in the module header's
+   ungated/holes list — the disclosure fix is required **whichever way the behaviour went**.
+2. **S6 taxonomy precondition note → AMEND (decidable = gated, type-dependent = not gated).** The old
+   blanket note stated the opposite of what T13b ships. Amended in place in the Operator Taxonomy
+   section above; the code is right, the doc was wrong.
 
 ### A6 — upstream verification (discharged at T11, recorded verbatim)
 Verified against `unclebob/mutate4go` `internal/runner/runner.go`:

@@ -54,4 +54,15 @@ design in `docs/design.md`.
 13. Before running any destructive experiment of your own (sabotage probes, bulk rewrites, dependency
     surgery), copy the affected files outside the repo and revert from that copy — **never** via
     `git checkout <file>`, `git restore <file>`, `git stash`, or `git reset --hard` on a dirty tree.
+14. **Declare your rosters before you code.** In your first message on a task, state in one line: *"new
+    enums / rosters / lists this task introduces: …"* (or "none"). A hand-kept roster is a **design**
+    defect that is visible in seconds from a diff but has three times reached the verifier instead —
+    declaring it up front makes it visible while it is still free to fix.
+15. **Roster question, in your definition of done:** *does this change add an enum we own, a `const ALL`
+    or array literal of our own variants, or a match arm-per-variant over an enum we own?* If yes, it is
+    declared by a roster macro (`declare_operators!`, `declare_kill_reasons!`), or you say in your report
+    why not. See `docs/design.md` → Conventions → "Hand-kept lists". This defect class is a **recognition**
+    failure — from inside the edit, `const ALL: [X; 3] = [...]` does not feel like a hand-kept list, it
+    feels like three obvious variants — so treat this as a prompt to look, not as reference material.
+
 

@@ -93,6 +93,13 @@ same boundary, which enforces their mutual exclusivity. *Latent gap (to close in
   literal in type position (an array length, a const-generic argument) is a compile-time constant whose
   mutation is a near-certain compile error — a wasted build scored `Killed`, i.e. score inflation with
   zero signal. Array **repeat expressions** (`[0u8; 1]`) are expressions and stay in scope.
+  - **"Expression" means *evaluated* code, not merely something `syn` models as an `Expr`.** A
+    const-generic parameter **default** (`struct S<const N: usize = 1>`) reaches the scanner via
+    `visit_generics`, bypassing the `syn::Type` guard, but is suppressed for the same reason as an array
+    length: semantically it is a type-level constant, and its mutants are overwhelmingly compile errors.
+  - Contrast a **literal in pattern position** (`match x { 1 => 0, … }`), which **is** a site: it is a
+    comparison against a value, it compiles, and a test can observe the change. A **constructor** pattern
+    (`Some(v)`) is **not** a site — it destructures, it constructs nothing.
 - **Hand-kept lists — classify by who owns the domain.** A list that must stay in sync with something
   else is a silent hole; the remedy depends on ownership.
   - **We own the domain** (e.g. `Operator::ALL`) ⇒ make the omission **inexpressible**. Generate the
@@ -109,4 +116,11 @@ same boundary, which enforces their mutual exclusivity. *Latent gap (to close in
 - **Do not establish by census what is checkable by construction or by test.** A conclusion that is
   right for a measurement that was wrong is unearned. Quantitative claims in a write-up either carry
   the command that produced them, or — preferably — are replaced by the test that makes them
-  unnecessary.
+  unnecessary. Two worked examples:
+  - *A syn-variant census.* "There is no fifth item enum" was argued from a broad proxy (how many syn
+    structs carry `attrs`) that was off by 30%; the missing fourth enum was found by a **test**, not by
+    the census, which had already "confirmed" the answer.
+  - *A recovery inventory.* After an unstaged file was destroyed, the inventory of what to rebuild was
+    written from recollection and mis-attributed a test module to a file that had survived intact and
+    never held it. The surviving files were the contract and they were right; the narrative was wrong.
+    **A recovery inventory is a quantitative claim: derive it from the artifact, never from memory.**
