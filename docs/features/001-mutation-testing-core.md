@@ -736,6 +736,28 @@ Verified against `unclebob/mutate4go` `internal/runner/runner.go`:
   may be stale."` on the reuse path. **Not implemented at T11 — owed to T12** (parity, and the user's
   only signal that the gate may be stale).
 
+### ⚠ Product decisions owed to the human (raised at T11 close) — RESOLVED
+1. **Sites inside the target file's own `#[cfg(test)] mod tests` → SKIP AT DISCOVERY, IN T12.**
+   Anders' option (a). The scanner gains `cfg(test)` filtering so test-module items are never
+   discovered as sites. Rationale: test-module lines are *always* covered by construction, so
+   covered-only gating would preferentially mutate test code while skipping genuinely uncovered
+   production code; a mutant of an assertion constant is killed by its own test, costs a full compile,
+   and carries no signal about test quality. This is a **deliberate divergence from upstream
+   mutate4go**, which never faced it (Go tests live in a separate `_test.go` file the one-file-at-a-time
+   model never selects). Lands in **T12 alongside covered-only gating**; expect the site count to drop.
+2. **`cargo-llvm-cov` install in CI → KEEP THE ACTION, PINNED TO A COMMIT SHA.** `taiki-e/install-action`
+   stays (it is materially faster than `cargo install cargo-llvm-cov --locked` at ~5.5 min/leg/run), but
+   the **moving `@v2` major tag is replaced with a full commit SHA** so the supply-chain surface is
+   frozen. T12 must make the change and record the pinned SHA. Whether the Windows leg resolves a
+   prebuilt remains to be observed on the first green run.
+3. **Visibility split → CONFIRMED.** `coverage` / `coverage_map` and their items tighten to
+   `pub(crate)` **in T12**, at the commit that first gives them real callers (tightening earlier would
+   trip `-D warnings` as `dead_code`). The **pre-existing** accidental surface (`apply`, `runner`,
+   `scanner`, `site`, `manifest`, `outcome`) stays with the **S8** sweep. Recorded as a T12 acceptance
+   item so it is not lost between the two.
+4. **`#![forbid(unsafe_code)]` → ADD IN T12.** The project profile has always mandated it and
+   `src/lib.rs` has never carried it. One line; stop carrying an unmet stated convention.
+
 ### ⚠ S5 slice-level items owed to the human (raised at S4 close) — RESOLVED
 1. **R8 / external tool dependency — CONFIRMED.** `cargo-llvm-cov` + `llvm-tools-preview` go into
    **both** CI legs (`ubuntu-latest` **and** `windows-latest`) at **T11**, and a missing tool is a hard
