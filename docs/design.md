@@ -100,6 +100,28 @@ same boundary, which enforces their mutual exclusivity. *Latent gap (to close in
   - Contrast a **literal in pattern position** (`match x { 1 => 0, … }`), which **is** a site: it is a
     comparison against a value, it compiles, and a test can observe the change. A **constructor** pattern
     (`Some(v)`) is **not** a site — it destructures, it constructs nothing.
+- **One invariant, one representation.** The general rule; hand-kept lists (below) are its most common
+  special case, but the shape is broader: **a single invariant given more than one representation, with
+  nothing forcing the representations to agree.** Whenever a change introduces or moves an invariant,
+  ask *in how many places does it now live, and what makes them agree?* Exactly three answers are
+  acceptable, in order of preference: **(i) one place** — enforcement by construction; **(ii) a shared
+  helper both sides call**; **(iii) a test that fails when they disagree**, which is the only answer
+  available over a domain we do not own. Layering (iii) over (i) is right where the domain is
+  half-foreign. Anything else is a defect.
+  - *One rule, six representations.* A `(method name, arity)` table gave one arity rule six rows; the
+    single test pinned one row, so five widenings survived. The fix was **(i)** — one shared guard with
+    the single exception computed (`arity = usize::from(operator == Operator::Expect)`), making per-name
+    widening inexpressible rather than merely tested against. The six rows were then kept as measured
+    insurance against a future re-split: **(iii) layered over (i)**.
+  - *Model vs. its documented contract.* A two-span mutation carried one `line`, so it was coverage-gated
+    on one line while the doc claimed `site.line` was the whole coverage key — false for every such site
+    in the repo. Two representations of "which lines does this site touch".
+  - *Two coupled `Option`s.* `swap_span` / `swap_line` must be `Some` together with nothing enforcing it,
+    and are read by different layers — so a desync silently reproduces a bug a test already "covers".
+    Over a domain we own, collapse to one field rather than adding a test.
+  - **This is structural, not a recognition failure.** The third and fourth instances were introduced *in
+    the same commit that repaired the first two*, while a prompt to watch for hand-kept lists was live.
+    A checklist scoped to *lists* cannot see a field/doc pair or a table over foreign keys.
 - **Hand-kept lists — classify by who owns the domain.** A list that must stay in sync with something
   else is a silent hole; the remedy depends on ownership.
   - **We own the domain** (e.g. `Operator::ALL`) ⇒ make the omission **inexpressible**. Generate the

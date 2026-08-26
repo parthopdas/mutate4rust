@@ -97,12 +97,13 @@ One or more tasks per slice.
 | T12 | S5 | Covered-only gating; uncovered sites reported & skipped; `--reuse-coverage`; coverage-absent behavior (A6); **report gains per-mutant records (counters become derived)**. | Done | `2cf768c` |
 | T13a | S6 | Token-level Rust operators that fit the current `Site` model: **float constants (`0.0↔1.0`, suffix preserved)**, bitwise (`&`↔`|`, `^→&`, `<<`↔`>>`), predicate-method swaps (`.is_some()`↔`.is_none()`, `.is_ok()`↔`.is_err()`). Plus T12 housekeeping: score-line qualifier, `#[cfg(test)]` gated in all **four** attribute-bearing item enums (`Item`, `ForeignItem`, `TraitItem`, `ImplItem`), `parse_export` into `mod tests`, target pre-flight parse. Also fixes a latent defect: `0f64` parses as a suffixed `LitInt` and was emitted as an integer site whose mapping then aborted the run. | Done | `3498087` |
 | T13b | S6 | (1) extract `mutant_source(original, site)` (owed from T12); (2) `KillReason::CompileError` **before** any undecidable-precondition operator ships; (3) scanner↔mapping **totality property test** (shipped **two-directional**: over-emission *and* under-emission); (4) **no sites inside `syn::Type`** rule; (5) `Stmt`/`Arm` cfg gate sweep; (6) structural operators that fit the current model (`Some(x)→None`, `Ok(x)→Err(_)`, `expr?→expr.unwrap()`, `.unwrap()→.unwrap_or_default()`, match-arm **guard drop**) + record rendering generalizes `canonical_token` → mutation description; (7) bump `Operator::ALL.len()` deliberately. **No Core model change.** Also: `declare_kill_reasons!` replaces the hand-kept `KillReason` roster; partial report printed before bailing on a mapping error. **`.expect(_)` did NOT ship — moved to T13c** (excluded on a premise `push_span` invalidated in the same commit). | Done | `c82cdf6` |
-| T13c | S6 | `Vec<Edit>` + `splice_all` (descending start order) driven by **arm-body swap alone**. **Justification reframed by Anders at T13b close:** the model's limit was never span disjointness — `push_span` proved it is *one contiguous byte range*, which is wider — it is that **`replacement` cannot read source at another location in the file**, and arm-body swap is the only S6 operator whose replacement text lives elsewhere. (It *could* be forced into one edit spanning body₁.start→body₂.end, but `replacement` would have to re-parse a slice; `Vec<Edit>` is the honest model. So T13c remains cleanly **droppable**.) Also absorbs: **`.expect(_)→.unwrap_or_default()`** (~6 lines, single contiguous span via `push_span`); **`visit_variant` cfg gate** + row in the position table; splitting the module header's ungated list into *reachable* vs *currently-unreachable*; **suppress `ConstParam.default`** per the human's T13b-close ruling, with a test and a doc line; add `literals_in_pattern_position_are_sites` and the *why* sentence to the constructor test; move the O3 overlap note to the module header (it now covers `SomeCall`/`Try`, not just arms); one sentence in `push_span` on the file-global monotonic byte-offset invariant. `replacement` survives as the single-token fast path. Blast radius: `site.rs`, `apply.rs` (+1 fn), one block in `pipeline.rs`. **S6 closes here.** | Pending | - |
-| T13d | S6+ | **Roster fold (new, added by Anders at T13b close — after T13c, all-or-nothing).** Declare each operator as a token→replacement pair inside `declare_operators!`, generating the enum, `ALL`, `canonical_token`, `description` (via `concat!`) **and** the token-for-token fast path of `replacement`, with `Zero`/`One`/`FloatZero`/`FloatOne` as declared exceptions routing to their existing functions. Makes `(Some,Some)`/`(None,None)` **unrepresentable** (deletes `structural_description` and its `panic!` arm) and makes **`description`↔`replacement` drift impossible by construction** — the property that actually matters, and the one a description-only fold does *not* address. Collapses three parallel 38/30-arm matches into one list. **Must not share a commit with a Core model change** — it touches the three byte-identical parity mappings (A5/C11). Only then consider merging `declare_operators!`/`declare_kill_reasons!` into one `declare_roster!` — **two instances is not a pattern; do not unify before then.** | Pending | - |
+| T13c | S6 | `Vec<Edit>` + `splice_all` (descending start order) driven by **arm-body swap alone**. **Justification reframed by Anders at T13b close:** the model's limit was never span disjointness — `push_span` proved it is *one contiguous byte range*, which is wider — it is that **`replacement` cannot read source at another location in the file**, and arm-body swap is the only S6 operator whose replacement text lives elsewhere. (It *could* be forced into one edit spanning body₁.start→body₂.end, but `replacement` would have to re-parse a slice; `Vec<Edit>` is the honest model. So T13c remains cleanly **droppable**.) Also absorbs: **`.expect(_)→.unwrap_or_default()`** (~6 lines, single contiguous span via `push_span`); **`visit_variant` cfg gate** + row in the position table; splitting the module header's ungated list into *reachable* vs *currently-unreachable*; **suppress `ConstParam.default`** per the human's T13b-close ruling, with a test and a doc line; add `literals_in_pattern_position_are_sites` and the *why* sentence to the constructor test; move the O3 overlap note to the module header (it now covers `SomeCall`/`Try`, not just arms); one sentence in `push_span` on the file-global monotonic byte-offset invariant. `replacement` survives as the single-token fast path. Blast radius: `site.rs`, `apply.rs` (+1 fn), one block in `pipeline.rs`. **S6 closes here.** **Shipped, plus two things the two FAIL rounds forced:** (a) the method-name **arity precondition is one shared guard** (`arity = usize::from(operator == Operator::Expect)`) — round 1 split it into six per-name `(name, arity)` rows and 5 of 6 widenings survived the one existing test, so the shape was restored to make per-name widening *inexpressible*, with the six table rows kept as measured insurance against a future re-split; (b) `Site` gained **`swap_line` + `Site::lines()`** and `select_sites` now gates on `lines().any(..)` — round 1 gated a two-line mutation on one line while the doc claimed `site.line` was the whole coverage key, false for **215 of 215** swap sites here. Location vs **extent** is now an explicit distinction. Roster 38→40; 221 lib + 3 e2e. | Done | `32157ab` |
+| T13c′ | S6+ | **Core model narrowing (new, ruled by Anders at T13c close — alone, after T13c, before T13d).** `Site`'s `swap_span: Option<Range<usize>>` + `swap_line: Option<usize>` must be `Some` together and **nothing enforces it**: all fields are `pub`, no `#[non_exhaustive]`, and the two fields are consumed by *different layers* (`operators::edits` keys off the span, `select_sites` off the line), so a desync is the T13c round-1 D2 defect reintroduced from a direction no test watches — Bhaskar proved `only_the_arm_body_swap_carries_a_second_span` still **passes** on a desynced `Site::swapping`. Collapse to **`Option<Swap { span, line }>`**: over a domain **we own**, design.md says make the illegal state inexpressible, and the one-field shape *retires* that guardrail rather than strengthening it. Not T13c rework (behaviour is correct, Bhaskar PASSed) and **not foldable into T13d** (a `Swap` struct is a model change; T13d is all-or-nothing over the parity mappings). **Also carries the human-approved emission gate:** suppress **identical-body swaps** in the scanner (~5 lines, `SiteCollector` holds `&str`) — two textually identical arm bodies are *syntactically decidable*, so the approved S6 precondition rule applies, and each one is a **provably-equivalent `Survived`** polluting the one actionable bucket with an entry no test can ever kill. Both halves touch the scanner. **Bright line recorded by Anders:** `Site` may carry **at most one** optional payload describing extent; a second operator-specific field is the signal to move to `enum Extent { Single, Swap { .. } }`, not to add a third `Option`. | Pending | - |
+| T13d | S6+ | **Roster fold (new, added by Anders at T13b close — after T13c, all-or-nothing).** Declare each operator as a token→replacement pair inside `declare_operators!`, generating the enum, `ALL`, `canonical_token`, `description` (via `concat!`) **and** the token-for-token fast path of `replacement`, with `Zero`/`One`/`FloatZero`/`FloatOne` as declared exceptions routing to their existing functions. Makes `(Some,Some)`/`(None,None)` **unrepresentable** (deletes `structural_description` and its `panic!` arm) and makes **`description`↔`replacement` drift impossible by construction** — the property that actually matters, and the one a description-only fold does *not* address. Collapses three parallel 38/30-arm matches into one list. **Must not share a commit with a Core model change** — it touches the three byte-identical parity mappings (A5/C11). Only then consider merging `declare_operators!`/`declare_kill_reasons!` into one `declare_roster!` — **two instances is not a pattern; do not unify before then.** **Sharpened at T13c close:** `ArmBodySwap` is a **third declaration category** — not token-declared, not function-routed like `Zero`/`One`/`FloatZero`/`FloatOne`, but carrying a **description and no mapping at all**. The macro must be able to express that, or it will force a fake mapping back into existence and defeat the whole property. Relatedly, `description_matches_the_mapping`'s new `Err(_) => assert!(operator == Operator::ArmBodySwap)` arm is *itself* a hand-written exception list of size one (the fourth instance of the drift shape); T13d must **derive** that exemption from the declaration rather than restate the variant name in a test. **Do not** split `operator.rs` out of `site.rs` while doing this: `SiteKind`/`Operator`/`declare_operators!`/`Edit`/`Site` are one domain — the mutation-site model — and a split would double an all-or-nothing diff and obscure the parity-mapping audit that is the reason T13d must be reviewable. | Pending | - |
 | T14 | S7 | Per-function normalized hashing (deterministic `syn` token reprint); differential selection; default-differential-when-manifest-exists. | Pending | - |
-| T15 | S7 | `--since-last-run`, `--mutate-all`, `--lines`; post-run manifest update; wire changed-count into `--scan`. | Pending | - |
+| T15 | S7 | `--since-last-run`, `--mutate-all`, `--lines`; post-run manifest update; wire changed-count into `--scan`. **Two items added at T13c close:** (1) decide `--lines` × **multi-line-site** semantics *explicitly* — coverage gating is `any()` because observability is **disjunctive** (the mutation is visible if any line it touches runs), but `--lines` is the user **scoping what may be edited**, so the recommended answer is **`all()`** (never edit a line the user excluded). Two predicates, one composition point, one sentence saying why they differ. Both filters share `select_sites`, so the temptation is to reuse the clause and inherit the disjunction silently: a ~2-line difference and a genuinely wrong answer if defaulted. (2) `MutantRecord` stores `site.line` only, so two distinct swap sites on one physical line render **identically** — two survivors a human cannot tell apart. Render extent for extent-carrying sites (`line 3 (with 4)`) when the record grows `function_id`. | Pending | - |
 | T16 | S8 | `--max-workers` isolated worker dirs (isolated target/source copy, seeded from warmed baseline) + aggregation. | Pending | - |
-| T17 | S8 | Test-phase timing + `--timeout-factor`; `--mutation-warning`, `--test-command`, `--verbose`. | Pending | - |
+| T17 | S8 | Test-phase timing + `--timeout-factor`; `--mutation-warning`, `--test-command`, `--verbose`. **T13c close:** the `--mutation-warning` default-50 re-measure is now **unblocked** (S6 roster complete) and materially more urgent — arm-body swap adds `n−1` sites per `match` and contributes **215 sites in this repo alone**, likely the largest single contributor to both site count and R1 run time. **Measure; do not estimate.** | Pending | - |
 
 ## Operator Taxonomy
 
@@ -138,7 +139,7 @@ same way); **idiomatic** entries are Rust-native additions. All are **active by 
 |-------|------------------|--------|
 | `Option` | `Some(x) → None`; `.is_some()` ↔ `.is_none()` | idiomatic |
 | `Result` | `.is_ok()` ↔ `.is_err()`; `Ok(x) → Err(_)` where a bound error value exists | idiomatic |
-| `match`-arm | drop an arm guard (`if guard` removed); swap two non-wildcard arm bodies | idiomatic |
+| `match`-arm | drop an arm guard (`if guard` removed); swap the bodies of each **adjacent pair** of arms (`n` arms ⇒ `n−1` sites), **wildcard arms included** | idiomatic |
 | `unwrap`/`expect` | `.unwrap()` / `.expect(_)` → `.unwrap_or_default()` (where `T: Default`) | idiomatic |
 | Float constant | `0.0` ↔ `1.0` (suffix `f32`/`f64` preserved) | idiomatic |
 | `?` operator | `expr? → expr.unwrap()` where the `Try` type permits | idiomatic |
@@ -1438,6 +1439,116 @@ All four accepted as Anders recommended.
    the records tell us whether it is worth taking.
 4. **Visibility item noted** — record the expected count-divergence magnitude once S6 lands. A5 stands
    as written.
+
+- **T13c — APPROVE-WITH-SUGGESTIONS** (no blockers) · **S6 CLOSES** (code-complete; one taxonomy row
+  needed the human's pen, now amended). Reviewed `git diff --cached` in full; verified mechanically that
+  `Operator::ALL` went 38→40, `RunConfig` still does not exist, the parity mappings are untouched, and
+  `select_sites` is still the single composition point.
+  - **The two in-lane calls were correct.** (a) Fixing the coverage-gating predicate rather than
+    escalating it: it is a predicate change inside the one function mandated as the composition point,
+    with no upstream parity constraint (mutate4go has no such operator) and no bucket change.
+    Documenting the hole instead would have shipped a doc asserting `site.line` is the coverage key
+    *knowing* it is false for 215 of 215 cases — the exact failure the T13b ungated-list correction was
+    written against. (b) Bhaskar's **no-`declare_operators!` ruling** on the method-name lookup is
+    endorsed, and is the *right application* of the design.md rule rather than an exemption from it: the
+    keys are foreign Rust method names, so "make the omission inexpressible" is unavailable **by
+    construction**, and the rule's foreign-domain branch says make the test the enforcement —
+    `every_operator_round_trips_through_the_scanner`, iterating the *generated* `ALL`, is exactly that.
+    The macro would generate the wrong direction anyway (operator→name, where the scanner needs
+    name→operator over an **open** set).
+  - **`Edit`/`splice_all` earns its keep at the minimum honest cost.** `edits()` is the single funnel,
+    `replacement` and `splice` are untouched, and `mutant_source` *shrank* to one line while gaining
+    generality. `splice_all` is 15 lines; the **watermark** formulation is the right one — it proves
+    disjointness as a by-product of the ordering instead of a separate O(n²) check — and
+    `splice_all_rejects_overlapping_edits` pinning that **abutting is not overlapping** is the boundary
+    that matters. The `Edit` doc is the best artefact in the change: it states the real limit, states
+    that a single-edit encoding would work, and states that two edits is a **clarity** choice — so the
+    T13b ruling now lives where a contributor will find it.
+  - **Containment holds; the one pressure is not T14–T17 but T13d** (see the sharpened T13d row).
+    T15 wants `Site::lines()`, not `Edit`; T16/T17 never touch site→bytes. **Say out loud so nobody
+    "optimises" it:** `edits()` allocates a `Vec` per mutant including the 99%+ single-edit case — that
+    is one allocation against a full `cargo test` run. **Do not** reach for `SmallVec` or a `Cow`-shaped
+    return; the uniform shape is the entire value.
+  - **`Site::lines()` is the right abstraction and the right name** — it draws precisely the distinction
+    round 1 was missing (**location** vs **extent**), returns an iterator so it is free at the one call
+    site and open at the next, and does not leak multi-location into the pipeline. **But it pre-empts a
+    T15 decision that must not be made by reflex** — see the T15 row.
+  - **The drift shape is structural, not a recognition failure — and the proof is in this very commit.**
+    The three prior instances are not identical: T12 `REASONS` and T13b `KillReason::ALL` were a *roster*
+    drifting from its enforcement; T13c (a) was **one rule given six representations**; T13c (b) was
+    **the model drifting from its documented contract**. The common structure is **a single invariant
+    given more than one representation, with nothing forcing the representations to agree** — a
+    hand-kept list is merely one special case. dave.md rules 14/15 catch only that special case: they
+    *structurally cannot* catch (a) (arm-per-variant over an **unowned** domain, which the prompt's own
+    scoping excludes) and cannot catch (b) at all (a field and a doc sentence are not a list). Decisive
+    evidence: **in the same round that fixed (a) by collapsing six representations to one, Dave
+    introduced `swap_span`/`swap_line` — one invariant, two representations, nothing forcing agreement,
+    consumed by two different layers.** A prompt that was live and had just fired twice did not prevent
+    the fourth instance. **Remedy: generalise the rule and give it a menu, not a category** —
+    *"What invariant does this change introduce or move? In how many places does it now live? What makes
+    them agree?"* with exactly three permitted answers: **(i) one place** (enforcement by construction),
+    **(ii) a shared helper both sides call**, **(iii) a test that fails when they disagree** — the only
+    answer available over a foreign domain. The repo already invented all three independently
+    (`declare_operators!`, `plain_decimal_float_value`, `cfg_test_suppresses_every_position_that_can_hold_a_site`),
+    and **round 2's own fix for (a) was answer (i)**. Keeping the six per-name test rows on top is (iii)
+    layered over (i) — correct belt-and-braces where the domain is half-foreign, and justified by
+    Bhaskar's measurement that 5 of 6 bypasses are caught by those rows. Pair it with a
+    **pre-implementation declaration** reframed as *"invariants this task introduces, and where each is
+    enforced"* — that is what makes a `swap_span`/`swap_line` pair visible while it is still free, which
+    no post-hoc list check ever will.
+  - **`Site` is now the widest Core type**, literally carrying two fields documented as "`Some` only for
+    `Operator::ArmBodySwap`" — the strongest argument for the T13c′ collapse *independent* of the desync
+    bug, since `Option<Swap>` turns two operator-specific fields into **one optional payload describing
+    extent**, a general concept a general type may own. Rejected alternatives: payload on `Operator` (it
+    must stay C-like for `ALL`/the generated roster); a shape enum *now* (churns every `byte_span`/`line`
+    reader across `report`/`coverage`/`pipeline` for zero present benefit).
+  - **Equivalent mutants — the measurement is exactly what the census rule asks for** (derived from the
+    artefact, located precisely, recorded where the detection would go), and it changes A5's plan: see
+    the resolved decision below. Two findings drove that: the deferral's stated reason was **factually
+    wrong** (`scan_source(source: &str)` *has* the source; `SiteCollector` merely does not hold a
+    reference — an artefact of the struct, not a fact about the layer), and there is a **second decidable
+    class neither round caught** — swapped bodies referencing **pattern-bound identifiers**
+    (`Some(v) => v * 2, None => 0` → `None => v * 2`, `v` unbound) are guaranteed compile errors, a shape
+    extremely common in idiomatic Rust that may dominate the operator's compile cost.
+  - **Architecture intact.** Core stays pure (`operators` now takes a `&Site` — a Core→Core inward edge,
+    no cycle), `apply`'s `use crate::site::Edit` points inward, the only outward edge remains the
+    sanctioned `pipeline → apply`/`runner`/`coverage`, and **`RunConfig` correctly still does not exist**.
+    A8 untouched; no new assumption, risk, or deferral. `Site`'s `pub` fields join the S8 visibility
+    sweep now that they are load-bearing.
+
+### ⚠ Product decisions raised by Anders at T13c close — RESOLVED
+All four decided by the human as recommended:
+1. **Wildcard arms — taxonomy amended, code stands.** The row said "swap two **non-wildcard** arm
+   bodies"; the implementation pairs *every* adjacent pair including the wildcard. The code is right: a
+   wildcard body is ordinary evaluated code, "the fallback is indistinguishable from its neighbour" is
+   exactly the weakness worth exposing, and excluding it loses sites for no principle. The row also
+   under-specified the **pairing strategy**, which is a real design choice. Amended to *"swap the bodies
+   of each adjacent pair of arms (`n` arms ⇒ `n−1` sites), wildcard arms included"*. **This was the sole
+   remaining item gating formal S6 closure — S6 is now closed.**
+2. **`Option<Swap>` narrowing → its own micro-task T13c′, before T13d.** Not T13c rework (behaviour
+   correct, Bhaskar PASSed), not a T13d fold (a `Swap` struct is a model change and T13d is
+   all-or-nothing over the parity mappings), not an accepted risk (the fix is ~15 lines confined to
+   files T13c already touched, and the cost of deferring rises the moment anything else constructs a
+   `Site`). The minimal alternative — extending `only_the_arm_body_swap_carries_a_second_span` to assert
+   on `swap_line` too — was **rejected as treating the symptom**: it patches one guardrail against one
+   drift direction over a domain we own, where the rule is to make the illegal state inexpressible.
+3. **Decidable bad swaps — gate identical bodies now, measure pattern-bindings first.** An identical-body
+   swap is a **provably-equivalent `Survived`**, so it corrupts the *one actionable bucket* — strictly
+   worse than an inflated `Killed`, and the unactionable-survivor problem flagged at T10/T12 arriving as
+   a systematic class rather than an accident. It is syntactically decidable, so the approved S6
+   precondition rule says suppress at emission; that lands in **T13c′** (both halves touch the scanner).
+   The pattern-binding class only inflates `Killed`, which `KillReason::CompileError` was built to price
+   — **measure before gating**, keeping the "skipping loses a site, guessing loses a build" posture.
+4. **The false deferral comment was corrected before the commit** rather than shipped and fixed later: a
+   false architectural justification is worse than none, because the next reader takes it for a
+   constraint. Round 3 was comment-only (+7 lines, one file), gates green, 221 lib + 3 e2e unchanged.
+
+**A5 gains, concretely:** the identical-body count **with its command and scoped to this codebase** —
+never as a general rate, since this repo is unrepresentative in exactly the measured dimension (wide
+dispatch `match`es with byte-identical arms); the pattern-binding compile-error class; and the
+per-operator `Killed (compile error):` listing owed since T13b, **now urgent** because arm-body swap is
+the first operator shipping *two* systematic compile-error classes. `syn::Type` and the const-param
+suppression remain named as site-count *reducers* against `ArmBodySwap` as a large *increaser*.
 
 ### S3 slice-level assumptions — awaiting human sign-off
 - **S3 mutates the user's real source file in place.** The only crash backstop is VCS (T7's documented

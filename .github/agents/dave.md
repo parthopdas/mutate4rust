@@ -54,15 +54,29 @@ design in `docs/design.md`.
 13. Before running any destructive experiment of your own (sabotage probes, bulk rewrites, dependency
     surgery), copy the affected files outside the repo and revert from that copy — **never** via
     `git checkout <file>`, `git restore <file>`, `git stash`, or `git reset --hard` on a dirty tree.
-14. **Declare your rosters before you code.** In your first message on a task, state in one line: *"new
-    enums / rosters / lists this task introduces: …"* (or "none"). A hand-kept roster is a **design**
-    defect that is visible in seconds from a diff but has three times reached the verifier instead —
-    declaring it up front makes it visible while it is still free to fix.
-15. **Roster question, in your definition of done:** *does this change add an enum we own, a `const ALL`
-    or array literal of our own variants, or a match arm-per-variant over an enum we own?* If yes, it is
-    declared by a roster macro (`declare_operators!`, `declare_kill_reasons!`), or you say in your report
-    why not. See `docs/design.md` → Conventions → "Hand-kept lists". This defect class is a **recognition**
-    failure — from inside the edit, `const ALL: [X; 3] = [...]` does not feel like a hand-kept list, it
-    feels like three obvious variants — so treat this as a prompt to look, not as reference material.
+14. **Declare your invariants before you code.** In your first message on a task, state in one line:
+    *"invariants this task introduces or moves, and where each is enforced: …"* (or "none"). Rosters are
+    the special case: also name any new enum / `const ALL` / list. Declaring up front makes the defect
+    visible while it is still free to fix — it has now reached the verifier **four** times.
+15. **The invariant question, in your definition of done.** Not *"did I add a list?"* — that framing is
+    too narrow and provably missed two of the four instances. Ask instead: **"What invariant does this
+    change introduce or move? In how many places does it now live? What makes them agree?"** Exactly
+    three answers are permitted:
+    - **(i) one place** — enforcement by construction (`declare_operators!`, `declare_kill_reasons!`, or
+      collapsing N representations into one, as the T13c arity guard did);
+    - **(ii) a shared helper both sides call** (e.g. `plain_decimal_float_value`);
+    - **(iii) a test that fails when they disagree** (e.g.
+      `cfg_test_suppresses_every_position_that_can_hold_a_site`) — **the only answer available over a
+      domain we do not own**, such as a table keyed on foreign Rust method names.
+
+    Prefer (i), then (ii), then (iii). Layering (iii) over (i) is correct where the domain is
+    half-foreign. If your answer is none of the three, you have a defect. See `docs/design.md` →
+    Conventions → "One invariant, one representation".
+
+    The defect class is **structural, not a recognition failure**: the shape is *a single invariant given
+    more than one representation with nothing forcing agreement*, and a hand-kept list is merely one
+    instance. In the same round that fixed six-representations-of-one-arity-rule, the pair
+    `swap_span`/`swap_line` was introduced — one invariant, two representations, two consuming layers,
+    nothing forcing agreement. Watching for *lists* would not have caught it.
 
 
