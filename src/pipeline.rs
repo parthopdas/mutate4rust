@@ -1,10 +1,10 @@
 //! The mutate loop (Application layer): coverage → baseline check → per-covered-
 //! site apply/test/classify/restore → report.
 //!
-//! This module orchestrates the existing seams without fusing them — [`splice`]
-//! stays pure, [`RestoreGuard`] owns the fs round-trip, and [`TestRunner`] owns
-//! the subprocess. It takes **domain primitives** (`&Path`, `&[String]`,
-//! [`Duration`], `bool`), never the clap `Cli`.
+//! This module orchestrates the existing seams without fusing them —
+//! [`splice_all`] stays pure, [`RestoreGuard`] owns the fs round-trip, and
+//! [`TestRunner`] owns the subprocess. It takes **domain primitives** (`&Path`,
+//! `&[String]`, [`Duration`], `bool`), never the clap `Cli`.
 //!
 //! # Stage order is load-bearing (R1)
 //!
@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::apply::{RestoreGuard, splice};
+use crate::apply::{RestoreGuard, splice_all};
 use crate::coverage;
 use crate::coverage_map::CoverageMap;
 use crate::operators;
@@ -66,13 +66,21 @@ struct Selection<'a> {
 /// [`scanner::scan_source`] and the mutate loop.
 ///
 /// Covered-only gating (T12) and `--lines` (T15) are both predicates over a
-/// site's `line`, so T15 extends *this* function rather than adding a second,
-/// independently-ordered filter. `site.line` is the whole coverage key, so every
-/// site on a line resolves identically.
+/// site's lines, so T15 extends *this* function rather than adding a second,
+/// independently-ordered filter.
+///
+/// A site is covered when **any** line it mutates is covered
+/// ([`Site::lines`]). Almost every site mutates exactly one line, for which that
+/// is the same thing as testing `site.line`; [`crate::site::Operator::ArmBodySwap`]
+/// mutates two, and measured over this repo's own sources its two halves are on
+/// **different lines in 215 of 215 cases**. Gating on `site.line` alone would
+/// therefore have bucketed a swap as `Uncovered` whenever only its *second* arm
+/// ran — even though the mutation is plainly observable there, since that arm
+/// would evaluate the first arm's body.
 fn select_sites<'a>(sites: &'a [Site], coverage: &CoverageMap) -> Selection<'a> {
     let (mutate, uncovered) = sites
         .iter()
-        .partition(|site| coverage.is_line_covered(site.line));
+        .partition(|site| site.lines().any(|line| coverage.is_line_covered(line)));
     Selection { mutate, uncovered }
 }
 
@@ -162,25 +170,19 @@ fn check_baseline(runner: &TestRunner) -> Result<()> {
 /// The full source text of the mutant for one `site`, spliced from the pristine
 /// `original`.
 ///
-/// The **single** point where a site becomes mutated bytes: slice the site's
-/// token, map it through [`operators::replacement`], splice the result back.
-/// Every later generalization of "what one site mutates" (T13c's multi-edit
-/// operators) changes this function and nothing else in the loop.
+/// The **single** point where a site becomes mutated bytes: ask
+/// [`operators::edits`] what this site replaces, and apply every edit over the
+/// original with [`splice_all`]. Most sites yield exactly one edit (the
+/// single-token fast path); the `match`-arm body swap yields two, because its
+/// replacement text is source elsewhere in the file.
 ///
 /// # Errors
 ///
 /// Returns an error if the site's byte span is outside `original`, if the
 /// operator's mapping rejects the token (an internal invariant violation — our
-/// own scanner never emits such a site), or if the splice span is invalid.
+/// own scanner never emits such a site), or if the edits are invalid or overlap.
 fn mutant_source(original: &str, site: &Site) -> Result<String> {
-    let token = original.get(site.byte_span.clone()).with_context(|| {
-        format!(
-            "mutation site at line {} has a byte span outside the source",
-            site.line
-        )
-    })?;
-    let replacement = operators::replacement(site.operator, token)?;
-    splice(original, &site.byte_span, &replacement)
+    splice_all(original, &operators::edits(original, site)?)
 }
 
 /// Applies each selected site in turn, runs the suite, records the mutant, and
@@ -225,7 +227,7 @@ fn mutate_sites(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_baseline, mutate_sites, mutate_with_coverage, select_sites};
+    use super::{check_baseline, mutant_source, mutate_sites, mutate_with_coverage, select_sites};
     use crate::apply::RestoreGuard;
     use crate::coverage_map::{CoverageMap, Region};
     use crate::outcome::{KillReason, MutantOutcome, MutantResult};
@@ -557,6 +559,38 @@ mod tests {
         drop(guard);
     }
 
+    /// A **multi-edit** site is written to disk as one mutant: the loop's single
+    /// point of mutation applies every edit, not just the first.
+    ///
+    /// This is the end-to-end proof that `Vec<Edit>` reaches the file — the
+    /// scanner's own composition test stops at the mutant *string*.
+    #[test]
+    fn a_multi_edit_site_becomes_one_mutant_with_both_edits_applied() {
+        let source = "fn f(x: i32) -> i32 { match x { 2 => 7, _ => 9 } }\n";
+        let (dir, runner) = seed(source, &shell("exit 0"));
+        let target = dir.path().join("target.rs");
+        let guard = RestoreGuard::new(&target).expect("read target");
+        let sites = scanner::scan_source(guard.original()).expect("parse target");
+        let swap = sites
+            .iter()
+            .find(|site| site.operator == Operator::ArmBodySwap)
+            .expect("an arm-body swap site");
+
+        assert_eq!(
+            mutant_source(guard.original(), swap).expect("both edits apply"),
+            "fn f(x: i32) -> i32 { match x { 2 => 9, _ => 7 } }\n",
+        );
+
+        let mut report = MutationReport::new("target.rs");
+        mutate_sites(&guard, &[swap], &runner, &mut report).expect("the loop runs");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            source,
+            "the target must be pristine again after the swap mutant",
+        );
+        drop(guard);
+    }
+
     #[test]
     fn mutate_with_coverage_reports_survivors_end_to_end() {
         // Full composition (baseline + loop) against a stub test command: green
@@ -614,6 +648,42 @@ mod tests {
 
         assert!(selection.mutate.is_empty());
         assert_eq!(selection.uncovered.len(), 2);
+    }
+
+    /// A **two-span** site is covered when *either* of its lines is covered.
+    ///
+    /// A swap's two arm bodies sit on different lines — measured over this repo's
+    /// own sources, 215 of 215 do — so gating on `site.line` alone bucketed the
+    /// mutant `Uncovered` whenever only the *second* arm ran, though the mutation
+    /// is plainly observable there: that arm would evaluate the first arm's body.
+    /// Both directions are pinned, and line 2 (neither half) is the control that
+    /// keeps gating from having simply been switched off.
+    #[test]
+    fn a_swap_site_is_covered_when_either_of_its_two_lines_is() {
+        let source =
+            "fn f(x: i32) -> i32 {\n    match x {\n        2 => 7,\n        _ => 9,\n    }\n}\n";
+        let sites = scanner::scan_source(source).expect("parse");
+        assert_eq!(sites.len(), 1, "the fixture must hold the swap site alone");
+        assert_eq!(sites[0].operator, Operator::ArmBodySwap);
+        assert_eq!(sites[0].line, 3, "the site's own half");
+        assert_eq!(sites[0].swap_line, Some(4), "the half it trades with");
+
+        for line in [3, 4] {
+            let selection = select_sites(&sites, &only_line_covered(line));
+            assert_eq!(
+                selection.mutate.len(),
+                1,
+                "a covered line {line} must select the swap",
+            );
+            assert!(selection.uncovered.is_empty());
+        }
+
+        let selection = select_sites(&sites, &only_line_covered(2));
+        assert!(
+            selection.mutate.is_empty(),
+            "control: neither half is on line 2",
+        );
+        assert_eq!(selection.uncovered.len(), 1);
     }
 
     #[test]

@@ -27,17 +27,26 @@
 //! | Predicate method | `is_some → is_none`; `is_none → is_some`; `is_ok → is_err`; `is_err → is_ok` | idiomatic (S6) |
 //! | `Option`/`Result` | `Some(x) → None`; `Ok → Err` | idiomatic (S6) |
 //! | `unwrap` | `unwrap → unwrap_or_default` | idiomatic (S6) |
+//! | `expect` | `expect(_) → unwrap_or_default()` | idiomatic (S6) |
 //! | `?` operator | `? → .unwrap()` | idiomatic (S6) |
 //! | `match`-arm guard | `if <guard> → ` (dropped) | idiomatic (S6) |
+//! | `match`-arm bodies | two arms trade bodies | idiomatic (S6) |
 //!
 //! The structural S6 rows are token-**independent**: each is one span the
 //! scanner chose so that a single replacement suffices — the whole `Some(x)`
 //! call, the `Ok` identifier alone (so the bound value survives), the `unwrap`
-//! method identifier, the `?` token, and the arm's `if <guard>`. Their
+//! method identifier, the whole `expect(msg)` call (so its argument goes with
+//! it), the `?` token, and the arm's `if <guard>`. Their
 //! preconditions (`T: Default`, a compatible error type, a permitting `Try`
 //! type) are **undecidable without type information**, so unlike the float rows
 //! they cannot be precondition-gated at emission; a mutant that does not compile
 //! is scored `Killed` with [`crate::outcome::KillReason::CompileError`] (A8/R4).
+//!
+//! The **arm body swap** is the one row that is not a mapping at all: its
+//! replacement text is source at *another* location in the file, which
+//! [`replacement`] by construction cannot read. It is expressed as two
+//! [`Edit`]s by [`edits`] — see [`Edit`] for why that, and not span
+//! disjointness, is what the multi-edit model is for.
 //!
 //! The three parity arithmetic mappings are **byte-identical to mutate4go** and
 //! must stay that way: S4/S6 only *add* the operators upstream never mutated. The
@@ -73,9 +82,9 @@
 //! * suffix-only forms with no decimal point — `0f64`, `1f32`;
 //! * trailing-dot forms — `0.`, `1.`.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
-use crate::site::Operator;
+use crate::site::{Edit, Operator, Site};
 
 /// Every Rust integer-literal suffix, longest first so a strip is unambiguous.
 const INT_SUFFIXES: [&str; 12] = [
@@ -100,6 +109,67 @@ const FLOAT_SUFFIXES: [&str; 2] = ["f32", "f64"];
 
 /// Every Rust integer-literal radix prefix.
 const RADIX_PREFIXES: [&str; 6] = ["0x", "0X", "0o", "0O", "0b", "0B"];
+
+/// Every byte-range replacement making up the mutant for `site`, over the
+/// pristine `original`.
+///
+/// The **single** place a site becomes edits. Two shapes:
+/// - the **single-token fast path** — one [`Edit`] over the site's own span,
+///   whose text comes from [`replacement`]. Every operator but one takes it, and
+///   deliberately so: routing them through the multi-edit path would buy nothing
+///   and hide the mapping.
+/// - the **swap path** — the two spans of a [`Site::swap_span`] site trade their
+///   source text. This exists because [`replacement`] is a function of
+///   `(Operator, token)` and cannot read source elsewhere in the file; see
+///   [`Edit`].
+///
+/// # Errors
+///
+/// Returns an error if either span falls outside `original` or off a UTF-8 char
+/// boundary, or if the operator's mapping rejects the token (an internal
+/// invariant violation — our own scanner never emits such a site).
+pub(crate) fn edits(original: &str, site: &Site) -> Result<Vec<Edit>> {
+    let token = span_text(original, &site.byte_span, site.line)?;
+    let Some(swap_span) = &site.swap_span else {
+        return Ok(vec![Edit::new(
+            site.byte_span.clone(),
+            replacement(site.operator, token)?,
+        )]);
+    };
+    let other = span_text(original, swap_span, site.line)?;
+    // **Textually identical bodies are a known equivalent-mutant source, deferred
+    // to T13c′.** When the two spans hold the same text, these two edits reproduce
+    // the original byte-for-byte: a provably-equivalent `Survived`, polluting the
+    // one actionable bucket with an entry no test can ever kill. **In this
+    // codebase**, 30 of 215 swap sites (~14%) trade identical bodies — the
+    // `&node.attrs` fan-outs in the `*_attrs` helpers and the `"*"`/`"*="`/`"&"`
+    // arms in `replacement`. Read that as a census of *these* sources, which are
+    // unrepresentative in exactly the measured dimension (wide dispatch `match`es
+    // with byte-identical arms), never as a general rate.
+    //
+    // Two identical bodies are decidable **syntactically**, so the S6 precondition
+    // rule applies: the site is suppressed at emission, in the scanner — that is
+    // T13c′. (A second decidable class, a swapped body referencing a pattern-bound
+    // identifier, is being *measured* first via `KillReason::CompileError` rather
+    // than gated.)
+    // Today the only detection is one `==` *here*, at the apply layer, where both
+    // strings are in hand. What stays A5's is the **bucketing policy** for
+    // whatever is not suppressed: the three buckets are parity-locked, so whether
+    // such a mutant is skipped outright or reported `Survived` with a note is the
+    // human's call.
+    Ok(vec![
+        Edit::new(site.byte_span.clone(), other.to_owned()),
+        Edit::new(swap_span.clone(), token.to_owned()),
+    ])
+}
+
+/// The source text under `span`, or a located error if the span is not a valid
+/// slice of `original`.
+fn span_text<'a>(original: &'a str, span: &std::ops::Range<usize>, line: usize) -> Result<&'a str> {
+    original
+        .get(span.clone())
+        .with_context(|| format!("mutation site at line {line} has a byte span outside the source"))
+}
 
 /// The mutated token text for `operator`, given the site's original token text.
 ///
@@ -150,10 +220,19 @@ pub(crate) fn replacement(operator: Operator, token: &str) -> Result<String> {
         Operator::SomeCall => "None",
         Operator::OkCall => "Err",
         Operator::Unwrap => "unwrap_or_default",
+        // The span covers `expect(msg)` whole, so the message argument is
+        // replaced along with the method name.
+        Operator::Expect => "unwrap_or_default()",
         Operator::Try => ".unwrap()",
         // The span covers `if <guard>`; dropping it leaves the arm's pattern and
         // body untouched.
         Operator::ArmGuard => "",
+        // The one operator with no token-for-token replacement: its text comes
+        // from another location in the file, so it is expressible only as the two
+        // edits [`edits`] builds. Reaching here means a caller bypassed `edits`.
+        Operator::ArmBodySwap => {
+            bail!("`match` arm bodies are swapped as two edits, not mapped from a token")
+        }
         Operator::Zero => return mutate_int_literal(token, 0, '1'),
         Operator::One => return mutate_int_literal(token, 1, '0'),
         Operator::FloatZero => return mutate_float_literal(token, 0, "1.0"),
@@ -291,8 +370,8 @@ fn split_suffix(token: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::replacement;
-    use crate::site::Operator;
+    use super::{edits, replacement};
+    use crate::site::{Edit, Operator, Site};
 
     /// Convenience: the mutated token for a fixed-mapping operator.
     fn map(operator: Operator, token: &str) -> String {
@@ -522,8 +601,75 @@ mod tests {
         assert_eq!(map(Operator::SomeCall, "Some(x)"), "None");
         assert_eq!(map(Operator::OkCall, "Ok"), "Err");
         assert_eq!(map(Operator::Unwrap, "unwrap"), "unwrap_or_default");
+        assert_eq!(
+            map(Operator::Expect, "expect(\"boom\")"),
+            "unwrap_or_default()"
+        );
         assert_eq!(map(Operator::Try, "?"), ".unwrap()");
         assert_eq!(map(Operator::ArmGuard, "if x > 2"), "");
+    }
+
+    /// The arm body swap is **not** on the token-for-token fast path: its
+    /// replacement text is source at another location in the file, so
+    /// [`replacement`] cannot produce it for any token and says so rather than
+    /// inventing one. [`edits`] is its only route.
+    #[test]
+    fn the_arm_body_swap_has_no_token_for_token_replacement() {
+        assert!(replacement(Operator::ArmBodySwap, "y").is_err());
+        assert!(replacement(Operator::ArmBodySwap, "").is_err());
+    }
+
+    /// The two edits of an arm-body swap are the two spans trading source text —
+    /// each carries the *other* span's bytes, which is precisely what
+    /// [`replacement`] cannot compute.
+    #[test]
+    fn the_swap_path_builds_two_edits_that_trade_source_text() {
+        let source = "fn f(x: i32) -> i32 { match x { 2 => 7, _ => 9 } }\n";
+        let first = source.find('7').expect("first body");
+        let second = source.find('9').expect("second body");
+        let site = Site::swapping(
+            Operator::ArmBodySwap,
+            first..first + 1,
+            second..second + 1,
+            1,
+            1,
+            None,
+        );
+
+        assert_eq!(
+            edits(source, &site).expect("valid spans"),
+            vec![
+                Edit::new(first..first + 1, "9".to_owned()),
+                Edit::new(second..second + 1, "7".to_owned()),
+            ],
+        );
+    }
+
+    /// Every other operator stays on the **single-token fast path**: one edit
+    /// over the site's own span, carrying exactly what [`replacement`] returns.
+    #[test]
+    fn the_fast_path_builds_exactly_one_edit_from_the_mapping() {
+        let source = "fn f(a: i32, b: i32) -> i32 { a + b }\n";
+        let plus = source.find('+').expect("the operator token");
+        let site = Site::new(Operator::Add, plus..plus + 1, 1, None);
+
+        assert_eq!(
+            edits(source, &site).expect("valid span"),
+            vec![Edit::new(plus..plus + 1, "-".to_owned())],
+        );
+    }
+
+    /// A span outside the source is an error naming the line, never a panic.
+    #[test]
+    fn edits_reject_a_span_outside_the_source() {
+        let source = "fn f() -> i32 { 1 }\n";
+        let site = Site::new(Operator::One, 900..901, 1, None);
+
+        let err = edits(source, &site).expect_err("span is outside the source");
+        assert!(
+            err.to_string().contains("line 1"),
+            "the error must locate the site: {err}",
+        );
     }
 
     /// Mutating an in-scope site always changes the token — a mapping that
@@ -558,7 +704,9 @@ mod tests {
         match operator {
             Operator::SomeCall => Some("`Some(_)` → `None`"),
             Operator::OkCall => Some("`Ok(_)` → `Err(_)`"),
+            Operator::Expect => Some("`expect(_)` → `unwrap_or_default()`"),
             Operator::ArmGuard => Some("`if <guard>` → dropped"),
+            Operator::ArmBodySwap => Some("`match` arm bodies swapped"),
             _ => None,
         }
     }
@@ -572,6 +720,13 @@ mod tests {
     ///
     /// The pinned string is additionally checked to mention what is actually
     /// spliced, so the table cannot drift away from [`replacement`] either.
+    ///
+    /// The `_ => None` wildcard in [`structural_description`] is **not** the
+    /// hand-kept list design.md forbids: the enforcement lives in **the pair**.
+    /// [`Operator::canonical_token`] is exhaustive by construction — it has no
+    /// wildcard — so a new token-less operator necessarily yields `(None, None)`
+    /// here and hits the `panic!`. `canonical_token`'s exhaustiveness is
+    /// load-bearing; `structural_description` is a lookup, not a roster.
     #[test]
     fn description_matches_the_mapping() {
         for operator in Operator::ALL {
@@ -583,17 +738,24 @@ mod tests {
                 ),
                 (None, Some(pinned)) => {
                     assert_eq!(operator.description(), pinned, "{operator:?}");
-                    let spliced = map(operator, "");
-                    if spliced.is_empty() {
-                        assert!(
+                    // A token-less operator that is still on the single-token
+                    // fast path must say what it splices. The one that is not —
+                    // the arm body swap, whose replacement is source elsewhere in
+                    // the file — has no such string by construction; its
+                    // rendering is anchored by the scanner's composition test.
+                    match replacement(operator, "") {
+                        Ok(spliced) if spliced.is_empty() => assert!(
                             pinned.contains("dropped"),
                             "{operator:?} splices nothing but does not say so",
-                        );
-                    } else {
-                        assert!(
+                        ),
+                        Ok(spliced) => assert!(
                             pinned.contains(&spliced),
                             "{operator:?} describes a replacement it does not splice",
-                        );
+                        ),
+                        Err(_) => assert!(
+                            operator == Operator::ArmBodySwap,
+                            "{operator:?} has no mapping and no exemption",
+                        ),
                     }
                 }
                 (Some(_), Some(_)) | (None, None) => panic!(

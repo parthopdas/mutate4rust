@@ -10,7 +10,7 @@
 //! Two pieces with a deliberate layer split:
 //! - [`splice`] is **pure** (no fs) — a byte-range replacement over a source
 //!   string. It stays defensive: a bad span returns `Err` rather than corrupting
-//!   bytes or panicking.
+//!   bytes or panicking. [`splice_all`] layers one mutant's [`Edit`]s over it.
 //! - [`RestoreGuard`] is the **infrastructure/adapter** piece (design.md → the
 //!   only layer touching fs): it holds an in-memory copy of the original bytes and
 //!   restores them on drop, so an unwinding panic during a test run still leaves
@@ -21,6 +21,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+
+use crate::site::Edit;
 
 /// Splices `replacement` over the `span` byte range of `original`, returning
 /// `original[..span.start] + replacement + original[span.end..]`.
@@ -64,6 +66,43 @@ pub fn splice(original: &str, span: &Range<usize>, replacement: &str) -> Result<
     spliced.push_str(&original[..span.start]);
     spliced.push_str(replacement);
     spliced.push_str(&original[span.end..]);
+    Ok(spliced)
+}
+
+/// Applies every edit of one mutant over `original`, in **descending start
+/// order**.
+///
+/// Order is the whole point: an edit changes the length of the text after it, so
+/// applying a lower edit first invalidates every higher offset. Applying from the
+/// end backwards leaves the not-yet-applied spans untouched, so each edit's span
+/// still means what the scanner said it meant. The caller may pass edits in any
+/// order.
+///
+/// Edits **within one mutant must not overlap** — overlapping ones would splice
+/// over each other's text and silently produce bytes no site described, so they
+/// are rejected rather than applied. Spans of *different* mutants freely overlap
+/// (see [`crate::scanner`]'s module header); each is applied to pristine source
+/// on its own.
+///
+/// # Errors
+///
+/// Returns an error — never panics — if two edits overlap, or if any span is
+/// invalid in the sense [`splice`] documents.
+pub fn splice_all(original: &str, edits: &[Edit]) -> Result<String> {
+    let mut ordered: Vec<&Edit> = edits.iter().collect();
+    ordered.sort_by_key(|edit| std::cmp::Reverse(edit.span.start));
+
+    let mut spliced = original.to_owned();
+    let mut lowest_applied = usize::MAX;
+    for edit in ordered {
+        ensure!(
+            edit.span.end <= lowest_applied,
+            "overlapping edits within one mutant: {:?} runs into {lowest_applied}",
+            edit.span,
+        );
+        spliced = splice(&spliced, &edit.span, &edit.replacement)?;
+        lowest_applied = edit.span.start;
+    }
     Ok(spliced)
 }
 
@@ -147,8 +186,85 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{RestoreGuard, splice};
+    use super::{RestoreGuard, splice, splice_all};
+    use crate::site::Edit;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Descending application order is what makes multi-edit mutants correct: an
+    /// edit changes the length of everything after it, so applying the *lower*
+    /// edit first would shift the higher span off its token. The edits are handed
+    /// over in ascending order here on purpose — `splice_all` orders them itself.
+    ///
+    /// The replacements deliberately differ in length from what they replace, so
+    /// an ascending application does not merely happen to work.
+    #[test]
+    fn splice_all_applies_every_edit_regardless_of_input_order() {
+        let original = "a + b - c\n";
+        let ascending = [
+            Edit::new(2..3, "MINUS".to_owned()),
+            Edit::new(6..7, "+".to_owned()),
+        ];
+        let descending = [ascending[1].clone(), ascending[0].clone()];
+
+        assert_eq!(
+            splice_all(original, &ascending).expect("valid edits"),
+            "a MINUS b + c\n",
+        );
+        assert_eq!(
+            splice_all(original, &descending).expect("valid edits"),
+            "a MINUS b + c\n",
+        );
+    }
+
+    /// Two edits of **one** mutant must not overlap — they would splice over each
+    /// other's text and yield bytes no site described. Spans of *different*
+    /// mutants may overlap freely; each is applied to pristine source alone.
+    #[test]
+    fn splice_all_rejects_overlapping_edits() {
+        let original = "a + b - c\n";
+        let overlapping = [
+            Edit::new(0..5, "x".to_owned()),
+            Edit::new(4..9, "y".to_owned()),
+        ];
+
+        assert!(splice_all(original, &overlapping).is_err());
+        // Abutting edits are not overlapping: `..5` ends where `5..` begins.
+        let abutting = [
+            Edit::new(0..5, "x".to_owned()),
+            Edit::new(5..9, "y".to_owned()),
+        ];
+        assert_eq!(
+            splice_all(original, &abutting).expect("valid edits"),
+            "xy\n"
+        );
+    }
+
+    /// A swap is two edits trading text; both land, and nothing between them
+    /// moves.
+    #[test]
+    fn splice_all_swaps_two_ranges() {
+        let original = "match x { 2 => 7, _ => 9 }\n";
+        let first = original.find('7').expect("first body");
+        let second = original.find('9').expect("second body");
+        let edits = [
+            Edit::new(first..first + 1, "9".to_owned()),
+            Edit::new(second..second + 1, "7".to_owned()),
+        ];
+
+        assert_eq!(
+            splice_all(original, &edits).expect("valid edits"),
+            "match x { 2 => 9, _ => 7 }\n",
+        );
+    }
+
+    /// An empty edit list leaves the source untouched, and one invalid span still
+    /// errors rather than corrupting bytes.
+    #[test]
+    fn splice_all_handles_the_degenerate_cases() {
+        let original = "a + b\n";
+        assert_eq!(splice_all(original, &[]).expect("no edits"), original);
+        assert!(splice_all(original, &[Edit::new(0..99, "x".to_owned())]).is_err());
+    }
 
     #[test]
     fn splice_replaces_token_in_the_middle() {

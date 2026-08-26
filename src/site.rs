@@ -14,11 +14,10 @@ use std::ops::Range;
 /// set (S3), the **arithmetic idiomatic completions** (S4: `/`, `%`, and the
 /// compound-assignment operators), and the **token-level S6 Rust-specific**
 /// classes (T13a: float constants, bitwise/shift operators, predicate-method
-/// swaps) plus the **structural S6** classes that still fit one span (T13b:
-/// `Some(x) → None`, `Ok(x) → Err(x)`, `.unwrap() → .unwrap_or_default()`,
-/// `expr? → expr.unwrap()`, arm-guard drop). Each class maps to one or more
-/// concrete [`Operator`]s. S6's `match`-arm **body swap** needs two disjoint
-/// spans and remains out of scope (T13c).
+/// swaps) plus the **structural S6** classes (T13b: `Some(x) → None`,
+/// `Ok(x) → Err(x)`, `.unwrap() → .unwrap_or_default()`, `expr? → expr.unwrap()`,
+/// arm-guard drop; T13c: `.expect(_) → .unwrap_or_default()` and the `match`-arm
+/// **body swap**). Each class maps to one or more concrete [`Operator`]s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteKind {
     /// Binary arithmetic operator — `+`, `-`, `*` (parity) and `/`, `%` (S4).
@@ -51,10 +50,18 @@ pub enum SiteKind {
     /// `.unwrap()` call (S6). The site's span is the **method name identifier
     /// only**.
     UnwrapCall,
+    /// `.expect(msg)` call (S6). The site's span covers **`expect(msg)` whole** —
+    /// method name through closing parenthesis — because the mutation drops the
+    /// argument along with the method.
+    ExpectCall,
     /// The `?` operator (S6). The site's span is the **`?` token only**.
     TryOperator,
-    /// A `match` arm's guard (S6). The site's span covers `if <guard>`, which the
-    /// mutation drops.
+    /// A `match` arm (S6). Hosts two operators with **different span semantics**:
+    /// [`Operator::ArmGuard`], whose span covers the `if <guard>` the mutation
+    /// drops, and [`Operator::ArmBodySwap`], whose span covers one arm body and
+    /// which carries a second span ([`Site::swap_span`]) for the body it trades
+    /// places with. The report line, rendered from
+    /// [`Operator::description`], is what tells the two apart.
     MatchArm,
 }
 
@@ -162,10 +169,14 @@ declare_operators! {
     OkCall,
     /// `.unwrap()`
     Unwrap,
+    /// `.expect(msg)`
+    Expect,
     /// `?`
     Try,
     /// a `match` arm guard
     ArmGuard,
+    /// two `match` arm bodies traded
+    ArmBodySwap,
 }
 
 impl Operator {
@@ -223,9 +234,14 @@ impl Operator {
             Operator::IsErr => "is_err",
             Operator::Try => "?",
             Operator::Unwrap => "unwrap",
-            // The span of a `Some(x)` call, an `Ok` constructor's identifier or an
-            // arm guard is source the author wrote, not a fixed token.
-            Operator::SomeCall | Operator::OkCall | Operator::ArmGuard => return None,
+            // The span of a `Some(x)` call, an `Ok` constructor's identifier, an
+            // `expect(msg)` call, an arm guard or an arm body is source the
+            // author wrote, not a fixed token.
+            Operator::SomeCall
+            | Operator::OkCall
+            | Operator::Expect
+            | Operator::ArmGuard
+            | Operator::ArmBodySwap => return None,
         };
         Some(token)
     }
@@ -278,8 +294,10 @@ impl Operator {
             Operator::SomeCall => "`Some(_)` → `None`",
             Operator::OkCall => "`Ok(_)` → `Err(_)`",
             Operator::Unwrap => "`unwrap` → `unwrap_or_default`",
+            Operator::Expect => "`expect(_)` → `unwrap_or_default()`",
             Operator::Try => "`?` → `.unwrap()`",
             Operator::ArmGuard => "`if <guard>` → dropped",
+            Operator::ArmBodySwap => "`match` arm bodies swapped",
         }
     }
 
@@ -314,9 +332,43 @@ impl Operator {
             Operator::SomeCall => SiteKind::OptionConstructor,
             Operator::OkCall => SiteKind::ResultConstructor,
             Operator::Unwrap => SiteKind::UnwrapCall,
+            Operator::Expect => SiteKind::ExpectCall,
             Operator::Try => SiteKind::TryOperator,
-            Operator::ArmGuard => SiteKind::MatchArm,
+            Operator::ArmGuard | Operator::ArmBodySwap => SiteKind::MatchArm,
         }
+    }
+}
+
+/// One byte-range replacement making up part of a mutant.
+///
+/// **Why a mutant is a list of edits and not a single span.** The model's limit
+/// was never "one `syn` span" — an assembled span (the arm guard's `if <expr>`)
+/// already proved a site may be *one contiguous byte range*, which is strictly
+/// wider. The real limit is that
+/// [`replacement`](crate::operators::replacement) is a function of
+/// `(Operator, token)`: it sees the site's own token text and nothing else, so it
+/// **cannot read source at another location in the file**.
+/// [`Operator::ArmBodySwap`] is the only operator whose replacement text lives
+/// elsewhere — each arm body is replaced by the *other* body's source — and that,
+/// not span disjointness, is what a `Vec<Edit>` is for.
+///
+/// It could be forced into a single edit spanning body₁.start → body₂.end, with
+/// the replacement being body₂ + the intervening source + body₁, and it would
+/// work — but `replacement` would then have to re-parse a slice of the file. Two
+/// edits is the honest model; this is a **clarity** choice, not a necessity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edit {
+    /// Byte range within the original source that this edit replaces.
+    pub span: Range<usize>,
+    /// Text spliced over [`span`](Edit::span).
+    pub replacement: String,
+}
+
+impl Edit {
+    /// Builds an edit replacing `span` with `replacement`.
+    #[must_use]
+    pub fn new(span: Range<usize>, replacement: String) -> Self {
+        Self { span, replacement }
     }
 }
 
@@ -334,7 +386,23 @@ pub struct Site {
     pub operator: Operator,
     /// Byte range of the operator/token within the source string (`start..end`).
     pub byte_span: Range<usize>,
-    /// 1-based line number of the site.
+    /// The **second** byte range this site trades text with, or `None` for every
+    /// site whose mutation is a function of its own token alone.
+    ///
+    /// `Some` only for [`Operator::ArmBodySwap`]: the two arm bodies each become
+    /// the other's source text, which no `(Operator, token)` mapping can produce
+    /// because the replacement text is at another location in the file. See
+    /// [`Edit`].
+    pub swap_span: Option<Range<usize>>,
+    /// 1-based line number of [`swap_span`](Site::swap_span), or `None` when
+    /// there is no second span.
+    ///
+    /// A swap site mutates two byte ranges that are **almost always on different
+    /// lines** — measured over this repo's own sources, 215 of 215 are — so
+    /// `line` alone does not describe what the mutation touches. See
+    /// [`Site::lines`].
+    pub swap_line: Option<usize>,
+    /// 1-based line number of the site's own span.
     pub line: usize,
     /// Fully-qualified path of the enclosing function (e.g. `Foo::bar`,
     /// `outer::inner`, `m::inner`), or `None` when the site is not inside any
@@ -357,9 +425,43 @@ impl Site {
         Self {
             operator,
             byte_span,
+            swap_span: None,
+            swap_line: None,
             line,
             function_id,
         }
+    }
+
+    /// Builds a site whose mutation trades the text of two byte ranges — today
+    /// only [`Operator::ArmBodySwap`]. `byte_span`/`line` are the site's own
+    /// (first) range; `swap_span`/`swap_line` are the ones it trades with.
+    #[must_use]
+    pub fn swapping(
+        operator: Operator,
+        byte_span: Range<usize>,
+        swap_span: Range<usize>,
+        line: usize,
+        swap_line: usize,
+        function_id: Option<String>,
+    ) -> Self {
+        Self {
+            operator,
+            byte_span,
+            swap_span: Some(swap_span),
+            swap_line: Some(swap_line),
+            line,
+            function_id,
+        }
+    }
+
+    /// Every line this site's mutation changes — its own, plus the second span's
+    /// for a swap site.
+    ///
+    /// `line` alone is the site's *location*; this is its **extent**, and the two
+    /// differ for [`Operator::ArmBodySwap`]. Coverage gating asks for the extent:
+    /// the mutation is observable if *any* line it changes executes.
+    pub fn lines(&self) -> impl Iterator<Item = usize> {
+        std::iter::once(self.line).chain(self.swap_line)
     }
 
     /// The site's taxonomy category, derived from its [`operator`](Site::operator).
@@ -379,10 +481,12 @@ mod tests {
     ///
     /// 22 → 33 at T13a: the S6 token-level operators (2 float constants,
     /// 5 bitwise/shift, 4 predicate methods). 33 → 38 at T13b: the five
-    /// structural S6 operators that fit one span.
+    /// structural S6 operators that fit one span. 38 → 40 at T13c:
+    /// `.expect(_)` (one contiguous span) and the `match`-arm body swap (two
+    /// spans).
     #[test]
     fn all_holds_the_declared_operator_roster() {
-        assert_eq!(Operator::ALL.len(), 38);
+        assert_eq!(Operator::ALL.len(), 40);
     }
 
     /// No two operators render the same description — a record's rendering would
@@ -432,6 +536,9 @@ mod tests {
                     format!("fn f(x: Option<i32>) -> bool {{ x.{token}() }}\n")
                 }
                 SiteKind::UnwrapCall => format!("fn f(x: Option<i32>) -> i32 {{ x.{token}() }}\n"),
+                SiteKind::ExpectCall => {
+                    "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n".to_owned()
+                }
                 SiteKind::OptionConstructor => {
                     "fn f(a: i32) -> Option<i32> { Some(a) }\n".to_owned()
                 }
@@ -502,7 +609,9 @@ mod tests {
         assert_eq!(Operator::SomeCall.kind(), SiteKind::OptionConstructor);
         assert_eq!(Operator::OkCall.kind(), SiteKind::ResultConstructor);
         assert_eq!(Operator::Unwrap.kind(), SiteKind::UnwrapCall);
+        assert_eq!(Operator::Expect.kind(), SiteKind::ExpectCall);
         assert_eq!(Operator::Try.kind(), SiteKind::TryOperator);
         assert_eq!(Operator::ArmGuard.kind(), SiteKind::MatchArm);
+        assert_eq!(Operator::ArmBodySwap.kind(), SiteKind::MatchArm);
     }
 }

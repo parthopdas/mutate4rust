@@ -24,26 +24,70 @@
 //! Only the literal form is recognised (`#[cfg(test)]`); composite predicates such
 //! as `#[cfg(any(test, feature = "x"))]` are not treated as test-only.
 //!
-//! The gate is applied at six points — [`Visit::visit_item`],
+//! The gate is applied at seven points — [`Visit::visit_item`],
 //! [`Visit::visit_trait_item`], [`Visit::visit_impl_item`],
-//! [`Visit::visit_foreign_item`] (T13a) and [`Visit::visit_stmt`],
-//! [`Visit::visit_arm`] (T13b) — each reading its node's attributes through a
-//! single `match` over every variant of that enum. The first four are the item
-//! enums `syn` 3.0.4 declares in `item.rs`, so an item in a file — free,
-//! associated, trait or `extern` block — is reached through one of them, and
-//! there is no per-visitor list of gated node types to keep by hand (T13a; a
-//! hand-kept list is exactly what `declare_operators!` was introduced to
-//! abolish).
+//! [`Visit::visit_foreign_item`] (T13a), [`Visit::visit_stmt`],
+//! [`Visit::visit_arm`] (T13b) and [`Visit::visit_variant`] (T13c) — each reading
+//! its node's attributes through a single `match` over every variant of that
+//! enum. The first four are the item enums `syn` 3.0.4 declares in `item.rs`, so
+//! an item in a file — free, associated, trait or `extern` block — is reached
+//! through one of them, and there is no per-visitor list of gated node types to
+//! keep by hand (T13a; a hand-kept list is exactly what `declare_operators!` was
+//! introduced to abolish).
 //!
-//! This claims coverage of *items*, statements and `match` arms, not of every
-//! position `syn` 3.0.4 attaches attributes to. The named remaining hole is the
-//! **expression statement**: in `#[cfg(test)] foo();` the attribute is parsed
-//! onto the `syn::Expr`, not onto the `syn::Stmt`, so [`stmt_attrs`] cannot see
-//! it and the call is still scanned. Closing it means reading attributes off
-//! every attribute-bearing `Expr` variant, which is a wider audit than T13b
-//! bought. `syn` 3.0.4 also carries `attrs` on `Field`, `Variant`, `FnArg`,
-//! `GenericParam`, `WherePredicate`, `Pat` and `Type`, and a `#[cfg(test)]`
-//! there is **not** gated today either.
+//! # The ungated positions, split by whether anything is behind them
+//!
+//! `syn` 3.0.4 attaches `attrs` to more positions than the seven above. The
+//! remaining ones are **not** one uniform set, and listing them as if they were
+//! retires the reader's attention: most are vacuous, and only the live ones are
+//! worth attention.
+//!
+//! **Ungated *and* reachable** — a `#[cfg(test)]` here really does leave a site
+//! behind:
+//! * the **expression statement**: in `#[cfg(test)] foo();` the attribute is
+//!   parsed onto the `syn::Expr`, not onto the `syn::Stmt`, so [`stmt_attrs`]
+//!   cannot see it and the call is still scanned. Closing it means reading
+//!   attributes off every attribute-bearing `Expr` variant, which is a wider
+//!   audit than S6 bought.
+//! * `Pat`: patterns really do hold sites — a **literal in pattern position** is
+//!   one (`match x { 1 => … }` is a comparison against a value, so it compiles
+//!   and a test can observe the change) — and nothing reads a `Pat`'s own
+//!   attributes. A `#[cfg(test)]` written before a `match` pattern is parsed onto
+//!   the *arm*, which **is** gated; this position is listed as live because of
+//!   what patterns *contain*, not because of a known attribute spelling.
+//!
+//! **Ungated but currently unreachable** — nothing behind them can emit a site,
+//! so gating them would be vacuous:
+//! * `Field`, `FnArg`, `WherePredicate`, `Type`: everything they hold is
+//!   `syn::Type`, which [`Visit::visit_type`] stops at (T13b).
+//! * `GenericParam`: lifetime and type parameters carry only types, and a
+//!   **const** parameter's default is skipped by [`Visit::visit_const_param`]
+//!   (T13c). Before that, `struct S<const N: usize = 1>` *did* emit a site for
+//!   `1` — it reaches the scanner through `visit_generics`, bypassing the
+//!   `visit_type` guard — which contradicted the written "no sites inside types"
+//!   rule and was disclosed nowhere. It is now suppressed and pinned by a test.
+//!
+//! Both halves are pinned by tests, not by this comment:
+//! `cfg_test_suppresses_every_position_that_can_hold_a_site` for the gated
+//! positions, `the_ungated_positions_with_nothing_behind_them_emit_no_sites` for
+//! the vacuous ones, and `literals_in_pattern_position_are_sites` for the live
+//! one. A `syn` bump that moves a position from one half to the other shows up as
+//! a failure, not as a stale comment.
+//!
+//! # O3 — spans of different mutants may overlap; edits of one mutant may not
+//!
+//! Two sites can have overlapping — even strictly nested — byte spans. A
+//! multi-token arm guard emits both an `ArmGuard` site covering `if <guard>` and
+//! the operator sites inside that guard; `Some(x?)` emits an `OptionConstructor`
+//! span strictly containing a `TryOperator` span. That is intended, not a bug:
+//! mutants are applied **one at a time**, each spliced over pristine source, so
+//! two overlapping sites never collide — they are simply two independent
+//! mutants.
+//!
+//! The distinction matters now that a mutant may carry several edits
+//! ([`crate::site::Edit`]): edits *within one mutant* are applied together and
+//! must **not** overlap, which [`crate::apply::splice_all`] enforces; spans
+//! *across different mutants* freely may.
 
 use std::ops::Range;
 
@@ -154,17 +198,46 @@ impl SiteCollector {
 
     /// Records a site from an **assembled** byte span.
     ///
-    /// This exists solely because one T13b site has no single `syn::Span` that
-    /// describes it: a `match` arm's guard is `if <expr>`, and `syn` 3.0.4 models
-    /// it as [`syn::PatGuard`] — the `if` token and the guard expression are
-    /// separate nodes, and neither one alone covers the text the mutation drops.
-    /// The span is therefore built from the `if` token's start and the guard
-    /// expression's end. Every other site comes from exactly one `syn` span and
-    /// goes through [`SiteCollector::push_site`].
+    /// This exists because some sites have no single `syn::Span` that describes
+    /// them: a `match` arm's guard is `if <expr>`, and `syn` 3.0.4 models it as
+    /// [`syn::PatGuard`] — the `if` token and the guard expression are separate
+    /// nodes, and neither one alone covers the text the mutation drops; an
+    /// `.expect(msg)` call spans its method name through its closing parenthesis
+    /// (T13c). The span is therefore built from one node's start and another
+    /// node's end.
+    ///
+    /// Assembling a span that way is valid because proc-macro2's fallback spans
+    /// carry **file-global, monotonically increasing byte offsets** for a single
+    /// parse: every span in one [`parse`] result indexes the same source string,
+    /// so an end taken from one node is directly comparable with a start taken
+    /// from another.
     fn push_span(&mut self, operator: Operator, byte_span: Range<usize>, line: usize) {
         let function_id = self.function_id();
         self.sites
             .push(Site::new(operator, byte_span, line, function_id));
+    }
+
+    /// Records a site whose mutation **trades the text of two byte ranges** —
+    /// today only [`Operator::ArmBodySwap`]. Neither range's replacement is
+    /// something the operator could compute from its own token; see
+    /// [`crate::site::Edit`].
+    fn push_swap(
+        &mut self,
+        operator: Operator,
+        byte_span: Range<usize>,
+        swap_span: Range<usize>,
+        line: usize,
+        swap_line: usize,
+    ) {
+        let function_id = self.function_id();
+        self.sites.push(Site::swapping(
+            operator,
+            byte_span,
+            swap_span,
+            line,
+            swap_line,
+            function_id,
+        ));
     }
 }
 
@@ -220,14 +293,6 @@ impl<'ast> Visit<'ast> for SiteCollector {
 
     /// A `match` arm. Gated for `#[cfg(test)]` like any other attribute-bearing
     /// node, and the source of the [`Operator::ArmGuard`] site.
-    ///
-    /// **O3 — deliberate span overlap.** A multi-token guard emits *both* an
-    /// `ArmGuard` site covering the whole `if <guard>` *and* the operator sites
-    /// nested inside the guard expression, whose spans lie strictly within it.
-    /// That is intended, not a bug: mutants are applied **one at a time**, each
-    /// spliced over pristine source, so two overlapping sites never collide —
-    /// they are simply two independent mutants. Combining or de-duplicating
-    /// overlapping spans would require the multi-span edit model, which is T13c.
     fn visit_arm(&mut self, node: &'ast syn::Arm) {
         if is_cfg_test(&node.attrs) {
             return;
@@ -243,6 +308,68 @@ impl<'ast> Visit<'ast> for SiteCollector {
         }
         visit::visit_arm(self, node);
     }
+
+    /// A `match` expression: each **adjacent pair** of arms trades bodies.
+    ///
+    /// One site per adjacent pair (`n` arms ⇒ `n - 1` sites), so a test that
+    /// cannot tell two neighbouring arms apart is exposed. Arms carrying
+    /// `#[cfg(test)]` are dropped before pairing, matching [`Visit::visit_arm`]'s
+    /// gate — the surviving arms are then paired in source order. A pair is
+    /// skipped when the swap could not parse; see [`arm_accepts_body`].
+    ///
+    /// The site carries **two** spans, each arm body's, because the replacement
+    /// for one is the source text of the other and no `(Operator, token)` mapping
+    /// can produce it (see [`crate::site::Edit`]).
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        let last_index = node.arms.len().saturating_sub(1);
+        let arms: Vec<(usize, &syn::Arm)> = node
+            .arms
+            .iter()
+            .enumerate()
+            .filter(|(_, arm)| !is_cfg_test(&arm.attrs))
+            .collect();
+        for pair in arms.windows(2) {
+            let (first_index, first) = pair[0];
+            let (second_index, second) = pair[1];
+            if !arm_accepts_body(first, first_index == last_index, &second.body)
+                || !arm_accepts_body(second, second_index == last_index, &first.body)
+            {
+                continue;
+            }
+            let first_span = first.body.span();
+            let second_span = second.body.span();
+            self.push_swap(
+                Operator::ArmBodySwap,
+                first_span.byte_range(),
+                second_span.byte_range(),
+                first_span.start().line,
+                second_span.start().line,
+            );
+        }
+        visit::visit_expr_match(self, node);
+    }
+
+    /// An `enum` variant. Gated for `#[cfg(test)]` so a test-only variant's
+    /// **discriminant** (`#[cfg(test)] A = 1`) is not mutated — the same reason
+    /// as every other gated position: the mutant would change code that only
+    /// exists in test builds.
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        visit::visit_variant(self, node);
+    }
+
+    /// A const-generic **parameter**, whose default the walk does not enter.
+    ///
+    /// `struct S<const N: usize = 1>` reaches the scanner through
+    /// `visit_generics`, which **bypasses** the [`Visit::visit_type`] guard, so
+    /// without this the default `1` is emitted as an ordinary constant site.
+    /// Design.md: *"expression" means evaluated code, not merely something `syn`
+    /// models as an `Expr`* — a const-parameter default is semantically a
+    /// type-level constant, exactly like an array length, and its mutants are
+    /// overwhelmingly compile errors.
+    fn visit_const_param(&mut self, _node: &'ast syn::ConstParam) {}
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         self.scope.push(Frame::Function(node.sig.ident.to_string()));
@@ -290,10 +417,22 @@ impl<'ast> Visit<'ast> for SiteCollector {
 
     /// A zero-argument method call (`x.is_some()`, `x.unwrap()`) is a site whose
     /// span is the **method name identifier only**, so the mutation stays a
-    /// single-token replacement.
+    /// single-token replacement. `.expect(msg)` is the one exception: its
+    /// mutation drops the message argument too, so its span runs from the method
+    /// name to the closing parenthesis — still **one contiguous byte range**,
+    /// assembled by [`SiteCollector::push_span`].
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if let Some(operator) = method_call_operator(node) {
-            self.push_site(operator, node.method.span());
+            let method = node.method.span();
+            if operator == Operator::Expect {
+                self.push_span(
+                    operator,
+                    method.byte_range().start..node.paren_token.span.close().byte_range().end,
+                    method.start().line,
+                );
+            } else {
+                self.push_site(operator, method);
+            }
         }
         visit::visit_expr_method_call(self, node);
     }
@@ -500,15 +639,22 @@ fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
     }
 }
 
-/// Maps a zero-argument method call onto its [`Operator`], or `None` when the
-/// call is anything else.
+/// Maps a method call onto its [`Operator`], or `None` when the call is anything
+/// else.
 ///
-/// **Preconditions:** the call must have **no arguments** and **no turbofish** —
-/// a same-named method taking arguments or explicit generics is a different
-/// method, and swapping its name would be a knowingly non-compiling mutant. The
-/// arity rule is why `.expect("boom")` yields no site: it is not `.unwrap()` with
-/// a message, it is a different method, and `expect(m) → unwrap_or_default()`
-/// would leave a stray argument behind.
+/// **Preconditions:** the call must have **no turbofish** — a same-named method
+/// with explicit generics is a different method, and swapping its name would be a
+/// knowingly non-compiling mutant — and it must have the **exact arity** the
+/// mapping requires.
+///
+/// Arity is **one shared guard with a single declared exception**, not a
+/// per-name row: every mapped method takes zero arguments except `.expect(msg)`.
+/// `expect` is the exception because its span covers the argument list too
+/// (`expect(msg) → unwrap_or_default()`), so nothing is stranded, whereas a bare
+/// name swap over a one-argument method would leave a stray argument behind —
+/// which is why `.unwrap_or(x)` is not a site. One guard keeps the precondition
+/// **self-enforcing**: there is no per-name arity that could be widened on its
+/// own, so a single test pins the rule for all six names instead of one.
 ///
 /// **No receiver type inference is attempted.** mutate4rust is a *syntactic*
 /// tool: it has no type information, so a user-defined `is_some()` on an
@@ -518,17 +664,24 @@ fn binary_operator(op: &syn::BinOp) -> Option<Operator> {
 /// `unwrap → unwrap_or_default`, whose real precondition (`T: Default`) is
 /// undecidable without types.
 fn method_call_operator(call: &syn::ExprMethodCall) -> Option<Operator> {
-    if !call.args.is_empty() || call.turbofish.is_some() {
+    if call.turbofish.is_some() {
         return None;
     }
-    match call.method.to_string().as_str() {
-        "is_some" => Some(Operator::IsSome),
-        "is_none" => Some(Operator::IsNone),
-        "is_ok" => Some(Operator::IsOk),
-        "is_err" => Some(Operator::IsErr),
-        "unwrap" => Some(Operator::Unwrap),
-        _ => None,
+    let operator = match call.method.to_string().as_str() {
+        "is_some" => Operator::IsSome,
+        "is_none" => Operator::IsNone,
+        "is_ok" => Operator::IsOk,
+        "is_err" => Operator::IsErr,
+        "unwrap" => Operator::Unwrap,
+        "expect" => Operator::Expect,
+        _ => return None,
+    };
+    // The shared arity guard: zero arguments, `expect` excepted.
+    let arity = usize::from(operator == Operator::Expect);
+    if call.args.len() != arity {
+        return None;
     }
+    Some(operator)
 }
 
 /// The final path segment of a **one-argument plain-path call** — the shape
@@ -563,6 +716,23 @@ fn unary_constructor_segment(call: &syn::ExprCall) -> Option<&syn::PathSegment> 
     }
     let segment = path.path.segments.last()?;
     matches!(segment.arguments, syn::PathArguments::None).then_some(segment)
+}
+
+/// Whether `arm` would still parse holding `incoming` as its body — the one
+/// syntactic precondition on the arm-body swap.
+///
+/// A `match` arm may omit its trailing comma only when its body is a block (or
+/// it is the last arm). Moving a non-block body into such an arm strands the
+/// following arm's tokens and the file no longer parses — a guaranteed compile
+/// error, which the taxonomy gates at emission whenever it is syntactically
+/// decidable, and here it is.
+///
+/// Deliberately conservative: Rust also permits the comma after other
+/// block-shaped bodies (`if`, `match`, `loop`, …), and a pair whose incoming body
+/// is one of those is skipped rather than analysed. Skipping loses a site;
+/// guessing loses a build.
+fn arm_accepts_body(arm: &syn::Arm, is_last: bool, incoming: &syn::Expr) -> bool {
+    arm.comma.is_some() || is_last || matches!(incoming, syn::Expr::Block(_))
 }
 
 /// Maps an integer literal whose base-10 value is `0` or `1` onto the matching
@@ -1359,6 +1529,17 @@ mod tests {
                 ),
                 "a test-only `match` arm",
             ),
+            (
+                concat!(
+                    "enum E {\n",
+                    "    #[cfg(test)]\n",
+                    "    A = 1,\n",
+                    "    B,\n",
+                    "}\n"
+                ),
+                concat!("enum E {\n", "    A = 1,\n", "    B,\n", "}\n"),
+                "a test-only enum variant's discriminant",
+            ),
         ] {
             assert!(
                 !scan(control).is_empty(),
@@ -1475,16 +1656,11 @@ mod tests {
         assert!(scan_source("").is_ok());
     }
 
-    /// The mutant source a real run would write: the site's span replaced by its
-    /// operator's mapping, spliced over the pristine bytes.
+    /// The mutant source a real run would write: every edit the site describes,
+    /// applied over the pristine bytes — the same two calls the pipeline makes.
     fn splice(source: &str, site: &Site) -> String {
-        let replacement = crate::operators::replacement(site.operator, span_text(source, site))
-            .expect("mapping should succeed");
-        format!(
-            "{}{replacement}{}",
-            &source[..site.byte_span.start],
-            &source[site.byte_span.end..],
-        )
+        let edits = crate::operators::edits(source, site).expect("edits should be buildable");
+        crate::apply::splice_all(source, &edits).expect("edits should apply")
     }
 
     /// The one [`Operator::ArmGuard`] site in `source`, asserting there is
@@ -1629,6 +1805,12 @@ mod tests {
                 "`.unwrap()` spans the method name only",
             ),
             (
+                "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+                Operator::Expect,
+                "expect(\"boom\")",
+                "`.expect(msg)` spans method name through closing paren, message and all",
+            ),
+            (
                 "fn f(x: Option<i32>) -> Option<i32> { x?; x }\n",
                 Operator::Try,
                 "?",
@@ -1655,6 +1837,12 @@ mod tests {
     /// Each row pairs a form that must emit **no** site with the near-miss
     /// **control** that must emit one, so a row cannot pass because the scanner
     /// never looked at that shape at all.
+    ///
+    /// **Arity is pinned per method name**, even though
+    /// [`method_call_operator`] enforces it with one shared guard. The rows pin
+    /// *behaviour*, not the shape of the guard: were the guard ever re-split into
+    /// per-name rows, widening any single one of them would still fail here,
+    /// rather than the whole rule resting on the one `is_some` case.
     #[test]
     fn structural_forms_outside_the_precondition_emit_no_sites() {
         for (source, control, what) in [
@@ -1674,12 +1862,42 @@ mod tests {
                 "a two-argument `Ok` is not the constructor",
             ),
             (
-                "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+                "fn f(x: Option<i32>, d: i32) -> i32 { x.unwrap_or(d) }\n",
                 "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
-                "`.expect(m)` takes an argument, so it is not `.unwrap()`",
+                "`.unwrap_or(x)` takes an argument the name swap would strand",
             ),
             (
-                "fn f(x: i32) -> i32 { match x { y => y, _ => x } }\n",
+                "fn f(x: S) -> bool { x.is_ok(2) }\n",
+                "fn f(x: S) -> bool { x.is_ok() }\n",
+                "a one-argument `is_ok` namesake is a different method",
+            ),
+            (
+                "fn f(x: S) -> bool { x.is_none(2) }\n",
+                "fn f(x: S) -> bool { x.is_none() }\n",
+                "a one-argument `is_none` namesake is a different method",
+            ),
+            (
+                "fn f(x: S) -> bool { x.is_err(2) }\n",
+                "fn f(x: S) -> bool { x.is_err() }\n",
+                "a one-argument `is_err` namesake is a different method",
+            ),
+            (
+                "fn f(x: S) -> i32 { x.unwrap(2) }\n",
+                "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
+                "a one-argument `unwrap` namesake would strand its argument",
+            ),
+            (
+                "fn f(x: S) -> i32 { x.expect() }\n",
+                "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+                "a zero-argument `expect` namesake is not the one-message `expect`",
+            ),
+            (
+                "fn f(x: S) -> i32 { x.expect(\"a\", \"b\") }\n",
+                "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+                "a two-argument `expect` namesake would strand its second argument",
+            ),
+            (
+                "fn f(x: i32) -> i32 { match x { y => y } }\n",
                 "fn f(x: i32, c: bool) -> i32 { match x { y if c => y, _ => x } }\n",
                 "an arm without a guard has nothing to drop",
             ),
@@ -1695,39 +1913,66 @@ mod tests {
     /// Composition proof for every structural S6 row: the span the scanner
     /// reports, replaced by the operator's mapping, yields exactly these bytes —
     /// the mutant a real run would write to disk.
+    ///
+    /// Rows name the operator rather than assuming a single site, because a
+    /// `match` fixture also emits its arm-body swap.
     #[test]
     fn s6_structural_spans_and_mappings_compose_into_the_expected_mutant_source() {
-        for (source, expected) in [
+        for (source, operator, expected) in [
             (
                 "fn f(a: i32) -> Option<i32> { Some(a) }\n",
+                Operator::SomeCall,
                 "fn f(a: i32) -> Option<i32> { None }\n",
             ),
             (
                 "fn f() -> Option<i32> { Option::Some(2) }\n",
+                Operator::SomeCall,
                 "fn f() -> Option<i32> { None }\n",
             ),
             (
                 "fn f(a: i32) -> Result<i32, ()> { Ok(a) }\n",
+                Operator::OkCall,
                 "fn f(a: i32) -> Result<i32, ()> { Err(a) }\n",
             ),
             (
                 "fn f(x: Option<i32>) -> i32 { x.unwrap() }\n",
+                Operator::Unwrap,
+                "fn f(x: Option<i32>) -> i32 { x.unwrap_or_default() }\n",
+            ),
+            (
+                "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+                Operator::Expect,
                 "fn f(x: Option<i32>) -> i32 { x.unwrap_or_default() }\n",
             ),
             (
                 "fn f(x: Option<i32>) -> Option<i32> { x?; x }\n",
+                Operator::Try,
                 "fn f(x: Option<i32>) -> Option<i32> { x.unwrap(); x }\n",
             ),
             // Dropping the guard leaves the pattern and body untouched — and the
             // space the `if` used to occupy, which is harmless to `rustc`.
             (
                 "fn f(x: i32, c: bool) -> i32 { match x { y if c => y, _ => x } }\n",
+                Operator::ArmGuard,
                 "fn f(x: i32, c: bool) -> i32 { match x { y  => y, _ => x } }\n",
+            ),
+            (
+                "fn f(x: i32, c: bool) -> i32 { match x { y if c => y, _ => x } }\n",
+                Operator::ArmBodySwap,
+                "fn f(x: i32, c: bool) -> i32 { match x { y if c => x, _ => y } }\n",
             ),
         ] {
             let sites = scan(source);
-            assert_eq!(sites.len(), 1, "one site expected in `{source}`");
-            assert_eq!(splice(source, &sites[0]), expected);
+            let matching: Vec<&Site> = sites
+                .iter()
+                .filter(|site| site.operator == operator)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "exactly one {operator:?} site expected in `{source}`",
+            );
+            assert_eq!(splice(source, matching[0]), expected);
         }
     }
 
@@ -1785,8 +2030,9 @@ mod tests {
     /// operator sites nested inside it, with overlapping byte spans.
     ///
     /// This is deliberate. Mutants are applied one at a time, each spliced over
-    /// pristine source, so overlapping sites never collide — they are two
-    /// independent mutants. Combining spans is T13c.
+    /// pristine source, so overlapping sites never collide — they are independent
+    /// mutants. It is only the edits *within* one mutant that must be disjoint
+    /// (see the module header, and [`crate::apply::splice_all`]).
     #[test]
     fn a_guard_emits_its_own_site_and_the_operator_sites_nested_inside_it() {
         let source =
@@ -1795,11 +2041,11 @@ mod tests {
 
         assert_eq!(
             sites.iter().map(|s| s.operator).collect::<Vec<_>>(),
-            vec![Operator::ArmGuard, Operator::Greater],
+            vec![Operator::ArmBodySwap, Operator::ArmGuard, Operator::Greater],
         );
 
-        let guard = &sites[0];
-        let nested = &sites[1];
+        let guard = &sites[1];
+        let nested = &sites[2];
         assert_eq!(span_text(source, guard), "if a > b");
         assert_eq!(span_text(source, nested), ">");
         assert!(
@@ -1811,9 +2057,216 @@ mod tests {
         );
     }
 
+    /// Each **adjacent pair** of arms trades bodies: `n` arms yield `n - 1`
+    /// swap sites, each mutant swapping exactly two bodies and leaving every
+    /// other byte alone. The mutants must also parse — a body span that clipped
+    /// a delimiter would strand tokens between the arms.
+    #[test]
+    fn arm_bodies_swap_between_every_adjacent_pair() {
+        let source = "fn f(x: i32) -> i32 { match x { 2 => 7, 3 => 8, _ => 9 } }\n";
+        let swaps: Vec<Site> = scan(source)
+            .into_iter()
+            .filter(|site| site.operator == Operator::ArmBodySwap)
+            .collect();
+
+        assert_eq!(swaps.len(), 2, "three arms yield two adjacent pairs");
+        for (site, first, second, expected) in [
+            (
+                &swaps[0],
+                "7",
+                "8",
+                "fn f(x: i32) -> i32 { match x { 2 => 8, 3 => 7, _ => 9 } }\n",
+            ),
+            (
+                &swaps[1],
+                "8",
+                "9",
+                "fn f(x: i32) -> i32 { match x { 2 => 7, 3 => 9, _ => 8 } }\n",
+            ),
+        ] {
+            let swap_span = site.swap_span.clone().expect("a swap carries two spans");
+            assert_eq!(span_text(source, site), first);
+            assert_eq!(&source[swap_span], second);
+
+            let mutated = splice(source, site);
+            assert_eq!(mutated, expected);
+            assert!(
+                syn::parse_file(&mutated).is_ok(),
+                "the swapped mutant must be valid Rust",
+            );
+        }
+    }
+
+    /// An arm that omits its trailing comma is only legal while its body is a
+    /// block, so it may swap with another **block** body and with nothing else.
+    ///
+    /// Without this precondition the mutant does not parse at all — a guaranteed
+    /// compile error, i.e. a guaranteed inflated `Killed`. Both rows are pinned:
+    /// the legal swap is emitted and parses, the illegal one is never emitted.
+    #[test]
+    fn a_comma_less_arm_swaps_only_with_a_block_body() {
+        let two_blocks = "fn f(x: i32) -> i32 { match x { 2 => { 7 } 3 => { 8 } _ => 9 } }\n";
+        let swaps: Vec<Site> = scan(two_blocks)
+            .into_iter()
+            .filter(|site| site.operator == Operator::ArmBodySwap)
+            .collect();
+        assert_eq!(
+            swaps.len(),
+            1,
+            "only the two block-bodied arms may trade bodies, got {swaps:?}",
+        );
+        let mutated = splice(two_blocks, &swaps[0]);
+        assert_eq!(
+            mutated,
+            "fn f(x: i32) -> i32 { match x { 2 => { 8 } 3 => { 7 } _ => 9 } }\n",
+        );
+        assert!(syn::parse_file(&mutated).is_ok(), "the mutant must parse");
+
+        let block_then_bare = "fn f(x: i32) -> i32 { match x { 2 => { 7 } _ => 9 } }\n";
+        assert!(
+            !scan(block_then_bare)
+                .iter()
+                .any(|site| site.operator == Operator::ArmBodySwap),
+            "moving `9` into a comma-less arm would not parse, so no site is emitted",
+        );
+    }
+
+    /// A `#[cfg(test)]` arm is dropped **before** pairing, so the arms either
+    /// side of it are paired with each other rather than with test-only code.
+    #[test]
+    fn a_test_only_arm_is_dropped_before_arms_are_paired() {
+        let source = concat!(
+            "fn f(x: i32) -> i32 {\n",
+            "    match x {\n",
+            "        2 => 7,\n",
+            "        #[cfg(test)]\n",
+            "        3 => 8,\n",
+            "        _ => 9,\n",
+            "    }\n",
+            "}\n",
+        );
+        let swaps: Vec<Site> = scan(source)
+            .into_iter()
+            .filter(|site| site.operator == Operator::ArmBodySwap)
+            .collect();
+
+        assert_eq!(swaps.len(), 1, "the two production arms form one pair");
+        let swap_span = swaps[0]
+            .swap_span
+            .clone()
+            .expect("a swap carries two spans");
+        assert_eq!(span_text(source, &swaps[0]), "7");
+        assert_eq!(&source[swap_span], "9");
+    }
+
+    /// The second span is what distinguishes a swap from every other site, and
+    /// [`Operator::ArmBodySwap`] is the only operator that carries one — the
+    /// invariant [`crate::operators::edits`] dispatches on.
+    #[test]
+    fn only_the_arm_body_swap_carries_a_second_span() {
+        for source in TOTALITY_CORPUS {
+            for site in scan(source) {
+                assert_eq!(
+                    site.swap_span.is_some(),
+                    site.operator == Operator::ArmBodySwap,
+                    "{:?} in `{source}` disagrees with its swap span",
+                    site.operator,
+                );
+            }
+        }
+    }
+
+    /// A const-generic parameter's **default** is a type-level constant, not
+    /// evaluated code, so it is not a site — even though it is a `syn::Expr` and
+    /// reaches the scanner through `visit_generics`, which bypasses the
+    /// `visit_type` guard.
+    ///
+    /// The control scans the same literal in expression position and requires a
+    /// site, so this cannot pass by `1` having gone out of scope everywhere.
+    #[test]
+    fn a_const_generic_parameter_default_is_not_a_site() {
+        for (source, what) in [
+            ("struct S<const N: usize = 1>;\n", "a struct's const param"),
+            (
+                "fn f<const N: usize = 1>() {}\n",
+                "a function's const param",
+            ),
+            (
+                "struct S<const N: usize = 1>(u8);\nimpl<const N: usize> S<N> {}\n",
+                "a const param alongside an impl",
+            ),
+        ] {
+            assert!(
+                scan(source).is_empty(),
+                "{what} must contribute no site, got {:?}",
+                scan(source),
+            );
+        }
+        assert_eq!(
+            scan("fn g() -> usize { 1 }\n").len(),
+            1,
+            "control: the same literal in expression position must be a site",
+        );
+    }
+
+    /// The module header's **"ungated but currently unreachable"** half, derived
+    /// rather than asserted: every one of these positions holds nothing but
+    /// `syn::Type` (or, for a const parameter, a default the walk skips), so no
+    /// site is emitted with **or** without `#[cfg(test)]`, and gating them would
+    /// be vacuous.
+    ///
+    /// Not a vacuous test: the control scans the identical literal in expression
+    /// position and requires a site, and each row fails the moment something
+    /// behind that position becomes reachable again — which is exactly when the
+    /// header's split would go stale.
+    #[test]
+    fn the_ungated_positions_with_nothing_behind_them_emit_no_sites() {
+        for (source, what) in [
+            ("struct S {\n    a: [u8; 1],\n}\n", "a field"),
+            (
+                "struct S {\n    #[cfg(test)]\n    a: [u8; 1],\n}\n",
+                "a test-only field",
+            ),
+            ("fn f(x: [u8; 1]) {}\n", "a function argument"),
+            (
+                "fn f(#[cfg(test)] x: [u8; 1]) {}\n",
+                "a test-only function argument",
+            ),
+            (
+                "fn f<T>(t: T)\nwhere\n    T: Into<[u8; 1]>,\n{\n}\n",
+                "a where-predicate",
+            ),
+            ("struct S<T = [u8; 1]>(T);\n", "a type parameter's default"),
+            (
+                "struct S<const N: usize = 1>;\n",
+                "a const parameter's default",
+            ),
+            ("type A = [u8; 1];\n", "a type alias"),
+        ] {
+            assert!(
+                scan(source).is_empty(),
+                "{what} must contribute no site, got {:?}",
+                scan(source),
+            );
+        }
+        assert_eq!(
+            scan("fn g() -> usize { 1 }\n").len(),
+            1,
+            "control: the same literal in expression position must be a site",
+        );
+    }
+
     /// `Some`/`Ok` in **pattern** position bind a value; they construct nothing,
     /// so mutating them would be nonsense. Each row is paired with the same
     /// constructor in **expression** position as a control.
+    ///
+    /// **Why this differs from a literal in pattern position, which *is* a
+    /// site** (see [`literals_in_pattern_position_are_sites`]): a literal pattern
+    /// is a **comparison against a value** — changing `1` to `0` changes which
+    /// inputs take the arm, it compiles, and a test can observe it. A constructor
+    /// pattern **destructures** — it constructs nothing, so there is no
+    /// constructed value to change and `Some(v) → None` would simply delete a
+    /// binding. The asymmetry is the design, not an oversight to be "fixed".
     #[test]
     fn constructors_in_pattern_position_are_not_sites() {
         for (pattern, control, what) in [
@@ -1834,15 +2287,49 @@ mod tests {
             ),
         ] {
             assert!(
-                !scan(control).is_empty(),
-                "control: {what} — the expression form must be a site",
+                scan(control)
+                    .iter()
+                    .any(|site| matches!(site.operator, Operator::SomeCall | Operator::OkCall)),
+                "control: {what} — the expression form must be a constructor site",
             );
+            // A `match` fixture also emits its arm-body swap, which is a property
+            // of the arms, not of the pattern; only constructor sites are at
+            // issue here.
             assert!(
-                scan(pattern).is_empty(),
-                "{what} must contribute no site, got {:?}",
+                !scan(pattern)
+                    .iter()
+                    .any(|site| matches!(site.operator, Operator::SomeCall | Operator::OkCall)),
+                "{what} must contribute no constructor site, got {:?}",
                 scan(pattern),
             );
         }
+    }
+
+    /// A **literal** in pattern position *is* a site, unlike a constructor.
+    ///
+    /// `match x { 1 => 0, _ => x }` compares `x` against `1`; mutating the
+    /// pattern to `0` changes which inputs take the arm, compiles, and is
+    /// observable by a test. Pinning it makes the asymmetry with
+    /// [`constructors_in_pattern_position_are_not_sites`] deliberate rather than
+    /// incidental.
+    ///
+    /// **Bool literals in pattern position are deliberately left alone**, even
+    /// though `match b { true => …, false => … }` mutates into a non-exhaustive
+    /// match — a guaranteed compile error, hence a guaranteed inflated `Killed`.
+    /// `KillReason::CompileError` now *measures* that, and it is a good early
+    /// validation of the instrument; revisit at the A5 measurement with data.
+    #[test]
+    fn literals_in_pattern_position_are_sites() {
+        let source = "fn f(x: i32) -> i32 { match x { 1 => 0, _ => x } }\n";
+        let sites = scan(source);
+        let pattern_start = source.find("1 =>").expect("the literal pattern");
+
+        let literal = sites
+            .iter()
+            .find(|site| site.byte_span.start == pattern_start)
+            .unwrap_or_else(|| panic!("no site at the literal pattern: {sites:?}"));
+        assert_eq!(literal.operator, Operator::One);
+        assert_eq!(span_text(source, literal), "1");
     }
 
     /// Sources exercising every shape the scanner can emit a site for, plus the
@@ -1877,6 +2364,8 @@ mod tests {
         "fn f(x: i32) -> i32 { match x { y if y > 7 => y, _ => x } }\n",
         "fn f() -> [u8; 1] { [0u8; 1] }\n",
         "fn f(x: Option<i32>) -> i32 { x.expect(\"boom\") }\n",
+        "struct S<const N: usize = 1>;\n",
+        "enum E {\n    #[cfg(test)]\n    A = 1,\n    B,\n}\n",
         "unsafe extern \"C\" {\n    static X: [u8; 1];\n}\n",
     ];
 
@@ -1884,24 +2373,28 @@ mod tests {
     ///
     /// Two properties in one, and they pull against each other, which is the
     /// point:
-    /// - *Over-emission fails loudly*: every site the scanner emits must map
-    ///   successfully. A site whose token `replacement` rejects — a `0f64`
+    /// - *Over-emission fails loudly*: every site the scanner emits must yield
+    ///   edits successfully. A site whose token `replacement` rejects — a `0f64`
     ///   emitted as an integer constant, say — fails here rather than surviving
     ///   to become a run-time mapping error mid-run.
     /// - *Under-emission fails loudly*: the corpus must collectively emit **every**
     ///   operator in [`Operator::ALL`]. Silently dropping a shape from discovery
     ///   would otherwise just make coverage rows quietly disappear.
+    ///
+    /// It runs over [`crate::operators::edits`], the one route from a site to
+    /// mutated bytes, so the multi-edit operators are covered on the same terms
+    /// as the single-token ones.
     #[test]
     fn every_emitted_site_has_a_successful_mapping() {
         let mut seen: Vec<Operator> = Vec::new();
 
         for source in TOTALITY_CORPUS {
             for site in scan(source) {
-                let token = span_text(source, &site);
                 assert!(
-                    crate::operators::replacement(site.operator, token).is_ok(),
-                    "{:?} emitted `{token}` in `{source}`, which has no mapping",
+                    crate::operators::edits(source, &site).is_ok(),
+                    "{:?} emitted `{}` in `{source}`, which has no mapping",
                     site.operator,
+                    span_text(source, &site),
                 );
                 if !seen.contains(&site.operator) {
                     seen.push(site.operator);
